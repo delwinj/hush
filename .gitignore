@@ -1,0 +1,27 @@
+# --------------------------------------------------
+# Secrets: never commit real secrets files
+# --------------------------------------------------
+secrets*.txt
+*-secrets.txt
+*.secrets.txt
+!secrets.example.txt
+
+# Redacted output written while testing
+*.redacted.*
+
+# --------------------------------------------------
+# Python
+# --------------------------------------------------
+__pycache__/
+*.py[cod]
+
+# --------------------------------------------------
+# Editors and OS
+# --------------------------------------------------
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+.DS_Store
+
