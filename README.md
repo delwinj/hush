@@ -20,12 +20,11 @@ on the clipboard, replaces every occurrence with a placeholder such as
 Matching is exact and case-insensitive: hush never guesses what might be
 sensitive, and it only reads the secrets files configured for it.
 
-Changes between versions are listed in [CHANGELOG.md](CHANGELOG.md). When
-updating across a breaking change, see [Upgrading](#upgrading).
+Changes between versions are listed in [CHANGELOG.md](CHANGELOG.md).
 
 ## Install
 
-Requires Linux with `python3` (standard library only). Clipboard mode needs
+Requires Linux with `python3` (standard library only). Clipboard modes need
 `wl-clipboard` on Wayland or `xclip` on X11:
 
 ```bash
@@ -132,28 +131,47 @@ one.
 some-command | hush
 some-command 2>&1 | hush               # also redact error output
 hush < app.log > app.redacted.log      # redact a file
+tail -f app.log | hush                 # follow a log as it grows
 some-command | hush | wl-copy          # redact, then copy the result
 ```
 
-Redacted text goes to stdout. A summary such as
-`hush: redacted 3: 2 <REDACTED-EMAIL>, 1 <REDACTED-IP>` goes to stderr; use
-`-q` to hide it. When the output goes to a terminal, a blank line separates it
-from the summary.
+Text is redacted and written line by line as it arrives, so following
+commands like `tail -f` or `kubectl logs -f` works. Redacted text goes to
+stdout. A summary such as
+`hush: redacted 3: 2 <REDACTED-EMAIL>, 1 <REDACTED-IP>` goes to stderr once
+the input ends; use `-q` to hide it. When the output goes to a terminal, a
+blank line separates it from the summary.
 
 If a secrets file is missing or invalid, hush exits with an error and writes
 nothing to stdout, so text never passes through unredacted.
 
-### Redact the clipboard
+### Redact the clipboard or primary selection
+
+Linux has two places that hold copied text: the **clipboard** (Ctrl+C,
+Ctrl+V) and the **primary selection**, which holds the most recently selected
+text and is pasted with a middle click. Copying selected text usually puts it
+in both.
 
 ```bash
-hush -c        # redact the clipboard in place
-hush -c -p     # preview the redacted text without changing the clipboard
+hush -c        # redact the clipboard
+hush -p        # redact the primary selection
+hush -cp       # redact both
+hush -cn       # preview the redacted clipboard, changing nothing
+hush -cpn      # preview both
 ```
 
-With `-c`, hush reads the clipboard as text, redacts it, writes it back, then
-reads it again to confirm the write. If nothing matched, the clipboard isn't
-touched. Paste with Ctrl+V afterwards; see [Limitations](#limitations) for
-middle-click paste.
+- Each selection is read as text, redacted, written back and read again to
+  confirm. A selection with nothing to redact isn't touched.
+- With `-cp`, both are read and redacted before either is written. Messages
+  are labelled with the selection they refer to.
+- With only `-c` or only `-p`, hush checks the other selection without
+  changing it, and warns if it also contains secrets.
+- An empty clipboard is an error. An empty or unsupported primary selection is
+  reported and skipped, since there's nothing to paste from it.
+
+`-n` prints the redacted text and changes nothing. With both selections, each
+block is labelled on stderr. To see only what would be redacted, discard the
+text and keep the summary: `hush -cn > /dev/null`.
 
 ### Add secrets
 
@@ -210,17 +228,22 @@ replaced atomically, symlinks are followed, and the mode is set to `600`.
 ## Reference
 
 ```text
-hush [-c] [-p] [-q] [--no-global]
+hush [-q] [--no-global]
+hush [-c] [-p] [-n] [-q] [--no-global]
 hush --files [--no-global]
 hush add [-l LABEL] [--file PATH] [--note TEXT] [--allow-short] [--no-split]
 hush --version
 ```
 
+Short options can be combined in any order: `-cpn` is the same as
+`-n -p -c`. For `hush add`, `add` must be the first argument.
+
 | Option | Meaning |
 | --- | --- |
-| `-c`, `--clipboard` | Redact the clipboard in place. |
-| `-p`, `--preview` | With `-c`: print the result without changing the clipboard. |
-| `-q`, `--quiet` | Hide the summary and informational messages. Errors and warnings still print. |
+| `-c`, `--clipboard` | Redact the clipboard. |
+| `-p`, `--primary` | Redact the primary selection. |
+| `-n`, `--preview` | With `-c` or `-p`: print the redacted text, changing nothing. |
+| `-q`, `--quiet` | Hide the summary and informational messages. Errors, warnings and preview labels still print. |
 | `--no-global` | Don't load the global file; use only `HUSH_SECRETS_FILES`. |
 | `--files` | Print the files that would be loaded, one per line. |
 | `add -l`, `--label LABEL` | Label for new secrets. Default: `redacted`. |
@@ -238,7 +261,7 @@ hush --version
 | --- | --- |
 | `0` | Success, including when nothing matched or nothing new was added. |
 | `1` | Error: secrets file, input, clipboard or write failure. |
-| `2` | Usage error: invalid options, or nothing piped in without `-c`. |
+| `2` | Usage error: invalid options, or nothing piped in without `-c` or `-p`. |
 | `130` | Cancelled with Ctrl+C. |
 
 All messages go to stderr, prefixed with `hush:`, and never contain a secret.
@@ -269,56 +292,10 @@ With `ip: 10.10.10.15` and `redacted: mysecret`:
 
 - Only listed secrets are redacted. New or rotated credentials pass through
   until you add them.
-- Input is read in full before output, so streaming commands like `tail -f`
-  never produce output.
-- Clipboard mode handles text only.
+- Clipboard modes handle text only.
 - Clipboard managers may keep the unredacted original in their history.
-- Selecting text also copies it to the primary selection (middle-click paste),
-  which hush doesn't redact.
 - `hush add` doesn't detect the file being edited at the same time; the last
   write wins.
-
-## Upgrading
-
-### To 0.3.0
-
-`HUSH_SECRETS_FILE` (singular) is no longer read, and hush doesn't warn if it's
-set. Previously it *replaced* the global file; now the global file always
-loads, and `HUSH_SECRETS_FILES` (plural) *adds* files to it.
-
-- Replace any `export HUSH_SECRETS_FILE=...` with
-  `export HUSH_SECRETS_FILES=...`. Until then, secrets in that file aren't
-  redacted.
-- To keep the old behavior of using only that file, add `--no-global`.
-- `hush add` now writes to the global file by default; use `--file` for
-  others.
-- When a secret is defined more than once, the last definition now wins
-  instead of the first.
-
-Check the result with `hush --files`.
-
-### To 0.2.0
-
-0.2.0 replaces section headers with one `label: secret` line per secret.
-Old files stop hush with
-`Invalid line N ... Section headers are no longer supported`, and must be
-converted by hand:
-
-- Put `label: ` in front of each secret under a `[label]` header, then delete
-  the header.
-- Put `redacted: ` in front of secrets above the first header or under
-  `[redacted]`.
-- Remove `\` escapes: `\#hash` becomes `#hash`.
-
-| 0.1.0 | 0.2.0 |
-| --- | --- |
-| `AKIAIOSFODNN7EXAMPLE` above any header | `redacted: AKIAIOSFODNN7EXAMPLE` |
-| `[email]` then `john@example.com` | `email: john@example.com` |
-| `[password]` then `\#hash` | `password: #hash` |
-
-Check the result with `echo | hush`. Take care with secrets that contain a
-colon: an unconverted `Note: abc` would be read as the label `note` with the
-secret `abc`.
 
 ## Development
 
@@ -327,8 +304,9 @@ python3 -m unittest -v test_hush.py
 ```
 
 The tests use temporary files and fake clipboard tools, so they never touch
-your real clipboard or secrets files. After changing clipboard code, also check
-by hand: copy text from a browser and a terminal, run `hush -c`, and paste.
+your real clipboard, primary selection or secrets files. After changing
+clipboard code, also check by hand: copy text from a browser and a terminal,
+run `hush -c` and `hush -p`, and paste with Ctrl+V and a middle click.
 
 ## Uninstall
 

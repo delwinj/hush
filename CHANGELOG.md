@@ -4,6 +4,26 @@ All notable changes to hush are documented here. Versions follow
 [Semantic Versioning](https://semver.org); while hush is below 1.0.0, minor
 versions may contain breaking changes.
 
+## [0.4.0] - 2026-11-12
+
+### Changed
+
+- **Breaking:** `-p` now means `--primary`. The short form of `--preview` is
+  `-n`.
+- `--preview` works with the clipboard, the primary selection or both. With
+  both, each block is labelled. It ends with "preview only; nothing was
+  modified."
+- Piped text is redacted and written line by line as it arrives, so
+  following commands like `tail -f` works. The output itself is unchanged.
+- Invalid lines no longer get a special hint about 0.1.0 section headers.
+
+### Added
+
+- `-p`/`--primary` to redact the primary selection (select, then middle-click
+  paste), alone or together with `-c`.
+- With only `-c` or only `-p`, a warning when the other selection also
+  contains secrets. The other selection is never changed.
+
 ## [0.3.0] - 2026-11-12
 
 ### Changed
@@ -37,7 +57,7 @@ versions may contain breaking changes.
 - **Breaking:** the secrets file format is now one `label: secret` line per
   secret. Unlabeled secrets use the `redacted` label. Section headers
   (`[label]`) and `\` escapes are no longer supported; files from 0.1.0 must
-  be converted by hand (see "Upgrading" in the README).
+  be converted by hand.
 - Secrets may contain any characters, including `:`, `=`, `#` and `[`,
   without escaping.
 

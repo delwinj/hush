@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""hush: redact configured secrets from piped input or the clipboard."""
+"""hush: redact configured secrets from piped input, the clipboard or the primary selection."""
 
 import argparse
 import datetime
@@ -15,7 +15,7 @@ import time
 from collections import Counter
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 FILES_VARIABLE = "HUSH_SECRETS_FILES"
 DEFAULT_LABEL = "REDACTED"
@@ -23,6 +23,9 @@ LABEL_RE = re.compile(r"[A-Za-z0-9_-]+")
 # A label, a colon, at least one whitespace character, then the secret.
 ENTRY_RE = re.compile(r"([A-Za-z0-9_-]+):\s+(.*)")
 MIN_ADD_LENGTH = 6
+
+# Display names for the two selections.
+SELECTION_NAMES = {"clipboard": "clipboard", "primary": "primary selection"}
 
 # Round-trip any bytes, even invalid UTF-8, without crashing.
 ENCODING = "utf-8"
@@ -153,21 +156,6 @@ def read_config(path):
         raise HushError(f"Unable to read secrets file {path}: {error}")
 
 
-def invalid_line_message(line, number, path):
-    # Never include the line itself: it may contain a secret.
-    if line.startswith("[") and line.endswith("]"):
-        hint = (
-            "Section headers are no longer supported; put the label at the "
-            "start of each line. See 'Upgrading' in the README."
-        )
-    else:
-        hint = (
-            "Expected 'label: secret' (a label, a colon, at least one space, "
-            "then the secret)."
-        )
-    return f"Invalid line {number} in {path}. {hint}"
-
-
 def parse_config(text, path):
     """
     Parse secrets file text into a list of (secret, LABEL, line_number).
@@ -186,7 +174,11 @@ def parse_config(text, path):
 
         match = ENTRY_RE.fullmatch(line)
         if not match:
-            raise HushError(invalid_line_message(line, number, path))
+            # Never include the line itself: it may contain a secret.
+            raise HushError(
+                f"Invalid line {number} in {path}. Expected 'label: secret' "
+                f"(a label, a colon, at least one space, then the secret)."
+            )
 
         entries.append((match.group(2), match.group(1).upper(), number))
 
@@ -314,29 +306,34 @@ def redact(text, secrets, pattern):
     return pattern.sub(replace, text), counts
 
 
-def report(counts, quiet):
+def report(counts, quiet, label=None):
     if quiet:
         return
 
+    prefix = f"{label}: " if label else ""
     total = sum(counts.values())
     if not total:
-        info("no configured secrets found; text unchanged.")
+        info(f"{prefix}no configured secrets found; text unchanged.")
         return
 
-    detail = ", ".join(f"{n} {label}" for label, n in counts.most_common())
-    info(f"redacted {total}: {detail}")
+    detail = ", ".join(f"{n} {name}" for name, n in counts.most_common())
+    info(f"{prefix}redacted {total}: {detail}")
 
 
 # --------------------------------------------------
-# Clipboard
+# Clipboard and primary selection
 # --------------------------------------------------
 
-def clipboard_commands():
+def clipboard_commands(selection):
+    """Return (paste, copy) commands for "clipboard" or "primary"."""
+    primary = selection == "primary"
+
     if os.environ.get("WAYLAND_DISPLAY"):
         if shutil.which("wl-paste") and shutil.which("wl-copy"):
+            flag = ["--primary"] if primary else []
             return (
-                ["wl-paste", "--no-newline", "--type", "text"],
-                ["wl-copy"],
+                ["wl-paste", *flag, "--no-newline", "--type", "text"],
+                ["wl-copy", *flag],
             )
         raise HushError(
             "Wayland session detected but wl-clipboard is not installed. "
@@ -346,8 +343,8 @@ def clipboard_commands():
     if os.environ.get("DISPLAY"):
         if shutil.which("xclip"):
             return (
-                ["xclip", "-selection", "clipboard", "-o", "-t", "UTF8_STRING"],
-                ["xclip", "-selection", "clipboard", "-t", "UTF8_STRING"],
+                ["xclip", "-selection", selection, "-o", "-t", "UTF8_STRING"],
+                ["xclip", "-selection", selection, "-t", "UTF8_STRING"],
             )
         raise HushError(
             "X11 session detected but xclip is not installed. "
@@ -359,26 +356,26 @@ def clipboard_commands():
     )
 
 
-def clipboard_read(paste):
+def clipboard_read(paste, name="clipboard"):
     try:
         result = subprocess.run(
             paste, capture_output=True, timeout=CLIPBOARD_TIMEOUT
         )
     except subprocess.TimeoutExpired:
-        raise HushError("Timed out reading the clipboard.")
+        raise HushError(f"Timed out reading the {name}.")
 
     if result.returncode != 0:
         detail = result.stderr.decode(errors="replace").strip()
         raise HushError(
-            f"Unable to read clipboard as text (is it empty or an image?): {detail}"
+            f"Unable to read {name} as text (is it empty or an image?): {detail}"
         )
 
     return result.stdout.decode(ENCODING, ERRORS)
 
 
-def clipboard_write(copy, text):
+def clipboard_write(copy, text, name="clipboard"):
     # wl-copy and xclip fork a background process that keeps serving the
-    # clipboard. Output goes to /dev/null so we don't wait on that process.
+    # selection. Output goes to /dev/null so we don't wait on that process.
     try:
         result = subprocess.run(
             copy,
@@ -388,27 +385,113 @@ def clipboard_write(copy, text):
             timeout=CLIPBOARD_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
-        raise HushError("Timed out writing the clipboard. Do NOT paste.")
+        raise HushError(f"Timed out writing the {name}. Do NOT paste.")
 
     if result.returncode != 0:
-        raise HushError("Unable to write the clipboard. Do NOT paste.")
+        raise HushError(f"Unable to write the {name}. Do NOT paste.")
 
 
-def clipboard_verify(paste, expected, attempts=10, delay=0.05):
-    # The background clipboard process may take a moment to take over,
-    # so retry briefly before declaring failure.
+def clipboard_verify(paste, expected, name="clipboard", attempts=10, delay=0.05):
+    # The background process may take a moment to take over, so retry
+    # briefly before declaring failure.
     for _ in range(attempts):
         try:
-            if clipboard_read(paste) == expected:
+            if clipboard_read(paste, name) == expected:
                 return
         except HushError:
             pass
         time.sleep(delay)
 
     raise HushError(
-        "Clipboard verification failed. Do NOT paste; "
-        "check the clipboard contents manually."
+        f"{name.capitalize()} verification failed. Do NOT paste; "
+        f"check the {name} contents manually."
     )
+
+
+def warn_other_selection(chosen, secrets, pattern):
+    """
+    With only one selection chosen, check the other one without changing
+    it, and warn if it also holds secrets. If it can't be read, there's
+    nothing to paste from it, so it's skipped silently.
+    """
+    other = "primary" if chosen == "clipboard" else "clipboard"
+    name = SELECTION_NAMES[other]
+    paste, _ = clipboard_commands(other)
+
+    try:
+        text = clipboard_read(paste, name)
+    except HushError:
+        return
+
+    _, counts = redact(text, secrets, pattern)
+    if counts:
+        how, option = (
+            ("middle-click paste", "-p") if other == "primary" else ("Ctrl+V paste", "-c")
+        )
+        info(
+            f"WARNING: the {name} also contains secrets ({how}). "
+            f"Use {option} to redact it."
+        )
+
+
+def run_selections(args, secrets, pattern):
+    chosen = [
+        selection
+        for selection, wanted in (("clipboard", args.clipboard), ("primary", args.primary))
+        if wanted
+    ]
+
+    # Read and redact every chosen selection before writing any of them.
+    blocks = []
+    for selection in chosen:
+        name = SELECTION_NAMES[selection]
+        paste, copy = clipboard_commands(selection)
+        try:
+            text = clipboard_read(paste, name)
+        except HushError:
+            if selection == "clipboard":
+                raise
+            # Nothing a middle click could paste, so not an error.
+            if not args.quiet:
+                info("the primary selection is empty or unavailable; nothing to redact.")
+            continue
+        result, counts = redact(text, secrets, pattern)
+        blocks.append((name, result, counts, paste, copy))
+
+    labelled = len(blocks) > 1
+
+    if args.preview:
+        for name, result, _, _, _ in blocks:
+            if labelled:
+                info(f"{name}:")
+            written = write_stdout(result, ensure_newline=True)
+            # With two blocks, the separators are needed to read the output.
+            separate_messages(written, args.quiet and not labelled)
+    else:
+        written_names = []
+        for name, result, counts, paste, copy in blocks:
+            if not counts:
+                continue
+            try:
+                clipboard_write(copy, result, name)
+                clipboard_verify(paste, result, name)
+            except HushError as error:
+                if written_names:
+                    raise HushError(
+                        f"{error} The {written_names[0]} was redacted, "
+                        f"but the {name} was not."
+                    )
+                raise
+            written_names.append(name)
+
+    for name, _, counts, _, _ in blocks:
+        report(counts, args.quiet, name if labelled else None)
+
+    if args.preview and not args.quiet:
+        info("preview only; nothing was modified.")
+
+    if len(chosen) == 1:
+        warn_other_selection(chosen[0], secrets, pattern)
 
 
 # --------------------------------------------------
@@ -437,6 +520,26 @@ def separate_messages(written, quiet):
     sys.stderr.flush()
 
 
+def redact_stream(secrets, pattern, quiet):
+    """
+    Redact stdin line by line, writing each line as soon as it's done, so
+    output from commands like `tail -f` appears as it arrives. Secrets
+    never contain line breaks, so this matches redacting all at once.
+    """
+    totals = Counter()
+    last = ""
+
+    for raw in sys.stdin.buffer:
+        # Splitting on the newline byte is safe for UTF-8: that byte never
+        # appears inside a multi-byte character.
+        result, counts = redact(raw.decode(ENCODING, ERRORS), secrets, pattern)
+        totals.update(counts)
+        last = write_stdout(result)
+
+    separate_messages(last, quiet)
+    report(totals, quiet)
+
+
 # --------------------------------------------------
 # hush (redaction)
 # --------------------------------------------------
@@ -444,7 +547,10 @@ def separate_messages(written, quiet):
 def run_redact(argv):
     parser = argparse.ArgumentParser(
         prog="hush",
-        description="Redact configured secrets from piped input or the clipboard.",
+        description=(
+            "Redact configured secrets from piped input, the clipboard or "
+            "the primary selection."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "commands:\n"
@@ -457,11 +563,15 @@ def run_redact(argv):
     )
     parser.add_argument(
         "-c", "--clipboard", action="store_true",
-        help="redact the clipboard in place",
+        help="redact the clipboard (Ctrl+C / Ctrl+V) in place",
     )
     parser.add_argument(
-        "-p", "--preview", action="store_true",
-        help="with -c: print the redacted clipboard without changing it",
+        "-p", "--primary", action="store_true",
+        help="redact the primary selection (select / middle-click) in place",
+    )
+    parser.add_argument(
+        "-n", "--preview", action="store_true",
+        help="with -c or -p: print the redacted text without changing anything",
     )
     parser.add_argument(
         "-q", "--quiet", action="store_true",
@@ -485,13 +595,15 @@ def run_redact(argv):
             write_stdout(f"{path}\n")
         return 0
 
-    if args.preview and not args.clipboard:
-        parser.error("--preview requires --clipboard")
+    selection_mode = args.clipboard or args.primary
 
-    if not args.clipboard and sys.stdin.isatty():
+    if args.preview and not selection_mode:
+        parser.error("--preview requires --clipboard or --primary")
+
+    if not selection_mode and sys.stdin.isatty():
         parser.error(
-            "no input piped. Pipe text in (e.g. 'env | hush') "
-            "or use -c for the clipboard."
+            "no input piped. Pipe text in (e.g. 'env | hush'), or use -c or "
+            "-p for the clipboard or primary selection."
         )
 
     # Load and validate configuration before touching any input,
@@ -499,29 +611,10 @@ def run_redact(argv):
     secrets = load_secrets(args.no_global)
     pattern = build_pattern(secrets)
 
-    if args.clipboard:
-        paste, copy = clipboard_commands()
-        text = clipboard_read(paste)
-        result, counts = redact(text, secrets, pattern)
-
-        if args.preview:
-            written = write_stdout(result, ensure_newline=True)
-            separate_messages(written, args.quiet)
-            report(counts, args.quiet)
-            if not args.quiet:
-                info("preview only; clipboard was NOT modified.")
-        else:
-            if counts:
-                clipboard_write(copy, result)
-                clipboard_verify(paste, result)
-            report(counts, args.quiet)
-
+    if selection_mode:
+        run_selections(args, secrets, pattern)
     else:
-        text = sys.stdin.buffer.read().decode(ENCODING, ERRORS)
-        result, counts = redact(text, secrets, pattern)
-        written = write_stdout(result)
-        separate_messages(written, args.quiet)
-        report(counts, args.quiet)
+        redact_stream(secrets, pattern, args.quiet)
 
     return 0
 

@@ -26,6 +26,23 @@ IS_ROOT = hasattr(os, "geteuid") and os.geteuid() == 0
 SYSTEM_PATH = "/usr/bin:/bin"
 
 
+def read_until(stream, marker, timeout=10):
+    """Read from a pipe until marker appears, without waiting for EOF."""
+    data = b""
+    deadline = time.monotonic() + timeout
+    while marker not in data:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return data
+        ready, _, _ = select.select([stream], [], [], remaining)
+        if ready:
+            chunk = os.read(stream.fileno(), 1024)
+            if not chunk:
+                return data
+            data += chunk
+    return data
+
+
 class HushTestCase(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -176,10 +193,10 @@ class FormatTests(HushTestCase):
             with self.assertRaises(hush.HushError):
                 self.load(content)
 
-    def test_old_section_header_hint(self):
+    def test_section_header_rejected(self):
         with self.assertRaises(hush.HushError) as ctx:
             self.load("[email]\njohn@example.com\n")
-        self.assertIn("Section headers are no longer supported", str(ctx.exception))
+        self.assertIn("Expected 'label: secret'", str(ctx.exception))
 
     def test_errors_never_include_line_content(self):
         for content in ("user:zq7hunter2\n", "[zq7hunter2]\n", "zq7hunter2\n"):
@@ -621,8 +638,8 @@ class PipeCliTests(HushTestCase):
         self.assertEqual(proc.returncode, 2)
         self.assertIn(b"no input piped", proc.stderr)
 
-    def test_preview_requires_clipboard(self):
-        proc = self.run_cli(["-p"], input=b"x")
+    def test_preview_requires_selection(self):
+        proc = self.run_cli(["-n"], input=b"x")
         self.assertEqual(proc.returncode, 2)
 
     def test_version(self):
@@ -645,7 +662,7 @@ class PipeCliTests(HushTestCase):
         proc = subprocess.run(
             cmd,
             shell=True,
-            input=b"a" * 300_000,
+            input=b"a\n" * 300_000,
             capture_output=True,
             env=env,
             timeout=20,
@@ -654,35 +671,114 @@ class PipeCliTests(HushTestCase):
 
 
 # --------------------------------------------------
-# Command line: clipboard mode (with fake clipboard tools)
+# Streaming
+# --------------------------------------------------
+
+class StreamingTests(HushTestCase):
+    def setUp(self):
+        super().setUp()
+        self.write_global("email: john@example.com\n")
+
+    def test_line_written_before_input_ends(self):
+        proc = subprocess.Popen(
+            [sys.executable, str(SCRIPT)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=self.cli_env({}),
+        )
+        try:
+            proc.stdin.write(b"to john@example.com\n")
+            proc.stdin.flush()
+            first = read_until(proc.stdout, b"\n")
+            still_running = proc.poll() is None
+
+            proc.stdin.write(b"and JOHN@example.com\n")
+            proc.stdin.close()
+            rest, stderr = proc.communicate(timeout=20)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+
+        self.assertEqual(first, b"to <REDACTED-EMAIL>\n")
+        self.assertTrue(still_running)
+        self.assertEqual(rest, b"and <REDACTED-EMAIL>\n")
+        self.assertIn(b"redacted 2:", stderr)
+
+    def test_summary_only_after_input_ends(self):
+        proc = subprocess.Popen(
+            [sys.executable, str(SCRIPT)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=self.cli_env({}),
+        )
+        try:
+            proc.stdin.write(b"john@example.com\n")
+            proc.stdin.flush()
+            read_until(proc.stdout, b"\n")
+            ready, _, _ = select.select([proc.stderr], [], [], 0.3)
+            proc.stdin.close()
+            _, stderr = proc.communicate(timeout=20)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+
+        self.assertEqual(ready, [])
+        self.assertIn(b"redacted 1:", stderr)
+
+    def test_output_matches_whole_input_redaction(self):
+        text = "10.10.10.15\n10.10.10.150\nx john@example.com y\nlast line"
+        self.write_global("ip: 10.10.10.15\nemail: john@example.com\n")
+        proc = self.run_cli(input=text.encode())
+        expected = self.redacted(None, text)
+        self.assertEqual(proc.stdout.decode(), expected)
+
+
+# --------------------------------------------------
+# Command line: clipboard and primary selection (with fake tools)
 # --------------------------------------------------
 
 FAKE_WL_PASTE = """#!/bin/sh
-[ -s "$FAKE_CLIP" ] || { echo "Nothing is copied" >&2; exit 1; }
-cat "$FAKE_CLIP"
+store="$FAKE_CLIP"
+for arg in "$@"; do [ "$arg" = "--primary" ] && store="$FAKE_PRIMARY"; done
+[ -s "$store" ] || { echo "Nothing is copied" >&2; exit 1; }
+cat "$store"
 """
 
 FAKE_WL_COPY = """#!/bin/sh
-touch "$FAKE_CLIP.written"
-cat > "$FAKE_CLIP"
+store="$FAKE_CLIP"
+for arg in "$@"; do [ "$arg" = "--primary" ] && store="$FAKE_PRIMARY"; done
+touch "$store.written"
+cat > "$store"
 """
 
 FAKE_XCLIP = """#!/bin/sh
+store="$FAKE_CLIP"
+output=0
+previous=""
 for arg in "$@"; do
-    if [ "$arg" = "-o" ]; then
-        [ -s "$FAKE_CLIP" ] || exit 1
-        cat "$FAKE_CLIP"
-        exit 0
+    if [ "$previous" = "-selection" ] && [ "$arg" = "primary" ]; then
+        store="$FAKE_PRIMARY"
     fi
+    [ "$arg" = "-o" ] && output=1
+    previous="$arg"
 done
-touch "$FAKE_CLIP.written"
-cat > "$FAKE_CLIP"
+if [ "$output" = 1 ]; then
+    [ -s "$store" ] || exit 1
+    cat "$store"
+    exit 0
+fi
+touch "$store.written"
+cat > "$store"
 """
 
 
 class ClipboardCliTests(HushTestCase):
     ORIGINAL = b"Contact john@example.com\n"
     REDACTED = b"Contact <REDACTED-EMAIL>\n"
+    PRIMARY = b"Mail john@example.com\n"
+    PRIMARY_REDACTED = b"Mail <REDACTED-EMAIL>\n"
 
     def setUp(self):
         super().setUp()
@@ -694,19 +790,32 @@ class ClipboardCliTests(HushTestCase):
 
         self.clip = self.tmp / "clip"
         self.clip.write_bytes(self.ORIGINAL)
-        self.written_marker = Path(f"{self.clip}.written")
+        self.clip_written = Path(f"{self.clip}.written")
+
+        # Empty by default: nothing selected.
+        self.primary = self.tmp / "primary"
+        self.primary.write_bytes(b"")
+        self.primary_written = Path(f"{self.primary}.written")
 
         self.write_global("email: john@example.com\n")
         self.env = {
             "PATH": f"{self.bin}:{SYSTEM_PATH}",
             "WAYLAND_DISPLAY": "fake-wayland",
             "FAKE_CLIP": str(self.clip),
+            "FAKE_PRIMARY": str(self.primary),
         }
 
     def make_tool(self, name, body):
         path = self.bin / name
         path.write_text(body)
         path.chmod(0o755)
+
+    def x11_env(self):
+        env = {k: v for k, v in self.env.items() if k != "WAYLAND_DISPLAY"}
+        env["DISPLAY"] = ":99"
+        return env
+
+    # Clipboard
 
     def test_redacts_clipboard_in_place(self):
         proc = self.run_cli(["-c"], env=self.env)
@@ -715,15 +824,15 @@ class ClipboardCliTests(HushTestCase):
         self.assertIn(b"redacted 1:", proc.stderr)
 
     def test_preview_does_not_modify(self):
-        proc = self.run_cli(["-c", "-p"], env=self.env)
+        proc = self.run_cli(["-c", "-n"], env=self.env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout, self.REDACTED)
         self.assertEqual(self.clip.read_bytes(), self.ORIGINAL)
-        self.assertFalse(self.written_marker.exists())
-        self.assertIn(b"NOT modified", proc.stderr)
+        self.assertFalse(self.clip_written.exists())
+        self.assertIn(b"nothing was modified", proc.stderr)
 
     def test_preview_separated_on_terminal(self):
-        proc = self.run_cli_tty_stdout(["-c", "-p"], env=self.env)
+        proc = self.run_cli_tty_stdout(["-cn"], env=self.env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertTrue(proc.stderr.startswith(b"\nhush: "), proc.stderr)
 
@@ -731,7 +840,7 @@ class ClipboardCliTests(HushTestCase):
         self.clip.write_bytes(b"nothing secret")
         proc = self.run_cli(["-c"], env=self.env)
         self.assertEqual(proc.returncode, 0)
-        self.assertFalse(self.written_marker.exists())
+        self.assertFalse(self.clip_written.exists())
         self.assertIn(b"no configured secrets found", proc.stderr)
 
     def test_empty_clipboard_is_error(self):
@@ -752,10 +861,8 @@ class ClipboardCliTests(HushTestCase):
         self.assertEqual(proc.returncode, 1)
         self.assertIn(b"No graphical session", proc.stderr)
 
-    def test_x11_path(self):
-        env = {k: v for k, v in self.env.items() if k != "WAYLAND_DISPLAY"}
-        env["DISPLAY"] = ":99"
-        proc = self.run_cli(["-c"], env=env)
+    def test_x11_clipboard(self):
+        proc = self.run_cli(["-c"], env=self.x11_env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.clip.read_bytes(), self.REDACTED)
 
@@ -782,7 +889,124 @@ class ClipboardCliTests(HushTestCase):
         proc = self.run_cli(["-c"], env=env)
         self.assertEqual(proc.returncode, 1)
         self.assertEqual(self.clip.read_bytes(), self.ORIGINAL)
-        self.assertFalse(self.written_marker.exists())
+        self.assertFalse(self.clip_written.exists())
+
+    # Primary selection
+
+    def test_primary_only(self):
+        self.primary.write_bytes(self.PRIMARY)
+        proc = self.run_cli(["-p"], env=self.env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.primary.read_bytes(), self.PRIMARY_REDACTED)
+        self.assertEqual(self.clip.read_bytes(), self.ORIGINAL)
+        self.assertFalse(self.clip_written.exists())
+
+    def test_primary_only_warns_about_clipboard(self):
+        self.primary.write_bytes(self.PRIMARY)
+        proc = self.run_cli(["-p"], env=self.env)
+        self.assertIn(b"WARNING: the clipboard also contains secrets", proc.stderr)
+        self.assertIn(b"-c", proc.stderr)
+
+    def test_clipboard_only_warns_about_primary(self):
+        self.primary.write_bytes(self.PRIMARY)
+        proc = self.run_cli(["-c"], env=self.env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(
+            b"WARNING: the primary selection also contains secrets", proc.stderr
+        )
+        self.assertEqual(self.primary.read_bytes(), self.PRIMARY)
+        self.assertFalse(self.primary_written.exists())
+
+    def test_no_warning_when_other_selection_clean(self):
+        self.primary.write_bytes(b"nothing here\n")
+        proc = self.run_cli(["-c"], env=self.env)
+        self.assertNotIn(b"WARNING", proc.stderr)
+
+    def test_no_warning_when_other_selection_empty(self):
+        proc = self.run_cli(["-c"], env=self.env)
+        self.assertNotIn(b"WARNING", proc.stderr)
+        self.assertNotIn(b"primary", proc.stderr)
+
+    def test_primary_empty_is_noted_not_error(self):
+        proc = self.run_cli(["-p"], env=self.env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(b"empty or unavailable", proc.stderr)
+        self.assertFalse(self.primary_written.exists())
+
+    def test_both(self):
+        self.primary.write_bytes(self.PRIMARY)
+        proc = self.run_cli(["-cp"], env=self.env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.clip.read_bytes(), self.REDACTED)
+        self.assertEqual(self.primary.read_bytes(), self.PRIMARY_REDACTED)
+        self.assertIn(b"hush: clipboard: redacted 1:", proc.stderr)
+        self.assertIn(b"hush: primary selection: redacted 1:", proc.stderr)
+        self.assertNotIn(b"WARNING", proc.stderr)
+
+    def test_both_flag_order_irrelevant(self):
+        self.primary.write_bytes(self.PRIMARY)
+        proc = self.run_cli(["-pc"], env=self.env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.clip.read_bytes(), self.REDACTED)
+        self.assertEqual(self.primary.read_bytes(), self.PRIMARY_REDACTED)
+
+    def test_both_with_empty_primary(self):
+        proc = self.run_cli(["-cp"], env=self.env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.clip.read_bytes(), self.REDACTED)
+        self.assertIn(b"empty or unavailable", proc.stderr)
+        # Only one block, so no labels.
+        self.assertIn(b"hush: redacted 1:", proc.stderr)
+
+    def test_preview_primary_only(self):
+        self.primary.write_bytes(self.PRIMARY)
+        proc = self.run_cli(["-pn"], env=self.env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, self.PRIMARY_REDACTED)
+        self.assertFalse(self.primary_written.exists())
+
+    def test_preview_both_labelled(self):
+        self.primary.write_bytes(self.PRIMARY)
+        proc = self.run_cli(["-cpn"], env=self.env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, self.REDACTED + self.PRIMARY_REDACTED)
+        self.assertIn(b"hush: clipboard:\n", proc.stderr)
+        self.assertIn(b"hush: primary selection:\n", proc.stderr)
+        self.assertIn(b"nothing was modified", proc.stderr)
+        self.assertFalse(self.clip_written.exists())
+        self.assertFalse(self.primary_written.exists())
+
+    def test_preview_both_quiet_keeps_labels(self):
+        self.primary.write_bytes(self.PRIMARY)
+        proc = self.run_cli(["-cpnq"], env=self.env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(b"hush: clipboard:\n", proc.stderr)
+        self.assertIn(b"hush: primary selection:\n", proc.stderr)
+        self.assertNotIn(b"redacted", proc.stderr)
+        self.assertNotIn(b"nothing was modified", proc.stderr)
+
+    def test_primary_write_failure_after_clipboard(self):
+        self.primary.write_bytes(self.PRIMARY)
+        self.make_tool(
+            "wl-copy",
+            '#!/bin/sh\n'
+            'for arg in "$@"; do\n'
+            '    [ "$arg" = "--primary" ] && { cat > /dev/null; exit 1; }\n'
+            'done\n'
+            'cat > "$FAKE_CLIP"\n',
+        )
+        proc = self.run_cli(["-cp"], env=self.env)
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(self.clip.read_bytes(), self.REDACTED)
+        self.assertEqual(self.primary.read_bytes(), self.PRIMARY)
+        self.assertIn(b"clipboard was redacted", proc.stderr)
+
+    def test_x11_primary(self):
+        self.primary.write_bytes(self.PRIMARY)
+        proc = self.run_cli(["-p"], env=self.x11_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.primary.read_bytes(), self.PRIMARY_REDACTED)
+        self.assertEqual(self.clip.read_bytes(), self.ORIGINAL)
 
 
 # --------------------------------------------------
@@ -946,11 +1170,11 @@ class AddTests(HushTestCase):
         self.assertEqual(proc.returncode, 1)
         self.assertEqual(self.global_file.read_text(), "user:password\n")
 
-    def test_old_format_file_refused(self):
+    def test_section_header_file_refused(self):
         self.global_file.write_text("[email]\njohn@example.com\n")
         proc = self.add(b"newsecret123\n")
         self.assertEqual(proc.returncode, 1)
-        self.assertIn(b"Section headers are no longer supported", proc.stderr)
+        self.assertIn(b"Expected 'label: secret'", proc.stderr)
 
     def test_missing_global_file(self):
         self.global_file.unlink()
@@ -1057,19 +1281,10 @@ class AddTests(HushTestCase):
 
             # Wait for the prompt before typing: getpass discards input
             # that arrives before it switches off echo.
-            stderr = b""
-            deadline = time.monotonic() + 10
-            while b"Secret" not in stderr:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    proc.kill()
-                    self.fail("prompt not shown")
-                ready, _, _ = select.select([proc.stderr], [], [], remaining)
-                if ready:
-                    chunk = os.read(proc.stderr.fileno(), 1024)
-                    if not chunk:
-                        break
-                    stderr += chunk
+            stderr = read_until(proc.stderr, b"Secret")
+            if b"Secret" not in stderr:
+                proc.kill()
+                self.fail("prompt not shown")
 
             os.write(master, b"promptedsecret1\n")
             stdout, rest = proc.communicate(timeout=20)
