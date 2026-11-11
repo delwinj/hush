@@ -1,11 +1,24 @@
 # hush
 
-Redact known secrets from text before you share it.
+Redact known secrets from terminal output and clipboard text before sharing it.
 
-hush replaces the secrets listed in your secrets file with placeholders like
-`<REDACTED>` or `<REDACTED-EMAIL>`, in piped text or directly in the
-clipboard. Matching is exact and case-insensitive: hush never guesses what
-might be sensitive, and it never uses a different secrets file than the one
+Getting help with a problem often means pasting command output, logs or
+configuration into an AI chat, a forum post, an issue tracker or a Discord
+channel. Ideally, that text would never contain sensitive values in the first
+place. In practice, terminal sessions get messy: while debugging,
+troubleshooting or learning a new tool, access keys, account IDs, email
+addresses, hostnames and internal IP addresses end up on screen right next to
+the output that matters. Removing them by hand, or copying the text in
+several pieces to leave them out, is tedious and easy to get wrong,
+especially when the same value appears many times.
+
+hush turns this into a single step. Sensitive values are listed once in a
+secrets file. After that, piping output through `hush`, or running `hush -c`
+on the clipboard, replaces every occurrence with a placeholder such as
+`<REDACTED>` or `<REDACTED-EMAIL>`, ready to paste.
+
+Matching is exact and case-insensitive: hush never guesses what might be
+sensitive, and it never uses a different secrets file than the one
 configured.
 
 Version 0.2.0. Upgrading from 0.1.0? See [Upgrading to 0.2.0](#upgrading-to-020).
