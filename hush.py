@@ -15,9 +15,9 @@ import time
 from collections import Counter
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
-ENV_VARIABLE = "HUSH_SECRETS_FILE"
+FILES_VARIABLE = "HUSH_SECRETS_FILES"
 DEFAULT_LABEL = "REDACTED"
 LABEL_RE = re.compile(r"[A-Za-z0-9_-]+")
 # A label, a colon, at least one whitespace character, then the secret.
@@ -43,31 +43,54 @@ def plural(count, word):
 
 
 # --------------------------------------------------
-# Secrets file location
+# Secrets file locations
 # --------------------------------------------------
 
-def default_secrets_file():
+def global_secrets_file():
     base = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
     return Path(base) / "hush" / "secrets.txt"
 
 
-def get_secrets_file():
+def configured_paths(no_global):
     """
-    1. HUSH_SECRETS_FILE, if set.
-    2. $XDG_CONFIG_HOME/hush/secrets.txt (normally ~/.config/hush/secrets.txt).
-
-    Whichever applies must exist and be readable. There is no fallback.
+    Return (path, source) pairs in load order, without checking that the
+    files exist: the global file first (unless no_global), then each entry
+    of HUSH_SECRETS_FILES. Entries must be absolute or start with ~/.
     """
-    if ENV_VARIABLE in os.environ:
-        value = os.environ[ENV_VARIABLE].strip()
-        if not value:
-            raise HushError(f"{ENV_VARIABLE} is set but empty.")
-        path = Path(value).expanduser()
-        source = ENV_VARIABLE
-    else:
-        path = default_secrets_file()
-        source = "default location"
+    paths = []
 
+    if not no_global:
+        paths.append((global_secrets_file(), "global"))
+
+    if FILES_VARIABLE in os.environ:
+        value = os.environ[FILES_VARIABLE]
+        if not value.strip():
+            raise HushError(f"{FILES_VARIABLE} is set but empty.")
+
+        for entry in value.split(":"):
+            entry = entry.strip()
+            if not entry:
+                raise HushError(
+                    f"{FILES_VARIABLE} contains an empty entry "
+                    f"(check for '::' or a leading or trailing ':')."
+                )
+            if not (entry.startswith("/") or entry.startswith("~/")):
+                raise HushError(
+                    f"{FILES_VARIABLE} entries must be absolute paths or "
+                    f"start with ~/: {entry}"
+                )
+            paths.append((Path(entry).expanduser(), FILES_VARIABLE))
+
+    if not paths:
+        raise HushError(
+            f"--no-global was given but {FILES_VARIABLE} is not set, so there "
+            f"are no secrets files to load."
+        )
+
+    return paths
+
+
+def check_file(path, source):
     try:
         exists = path.exists()
         is_file = path.is_file()
@@ -81,7 +104,33 @@ def get_secrets_file():
     if not is_file:
         raise HushError(f"Secrets path is not a regular file ({source}): {path}")
 
-    return path
+
+def secrets_files(no_global):
+    """
+    Return the secrets files to load, in load order. Every file must exist.
+    A file listed more than once loads once, at its first position.
+    """
+    files = []
+    seen = set()
+
+    for path, source in configured_paths(no_global):
+        check_file(path, source)
+        key = path.resolve()
+        if key not in seen:
+            seen.add(key)
+            files.append(path)
+
+    return files
+
+
+def is_loaded(path):
+    """Whether path is one of the files a normal run would load."""
+    try:
+        listed = configured_paths(no_global=False)
+    except HushError:
+        return False
+    target = path.resolve()
+    return any(candidate.resolve() == target for candidate, _ in listed)
 
 
 def warn_if_exposed(path):
@@ -109,7 +158,7 @@ def invalid_line_message(line, number, path):
     if line.startswith("[") and line.endswith("]"):
         hint = (
             "Section headers are no longer supported; put the label at the "
-            "start of each line. See 'Upgrading to 0.2.0' in the README."
+            "start of each line. See 'Upgrading' in the README."
         )
     else:
         hint = (
@@ -119,15 +168,15 @@ def invalid_line_message(line, number, path):
     return f"Invalid line {number} in {path}. {hint}"
 
 
-def parse_config(text, path, warn=True):
+def parse_config(text, path):
     """
-    Parse secrets file text into a list of (secret, LABEL) pairs.
+    Parse secrets file text into a list of (secret, LABEL, line_number).
 
     Blank lines and lines starting with # are ignored. Every other line
-    must be "label: secret". Duplicates (ignoring case) keep the first.
+    must be "label: secret". Duplicates are kept; load_secrets decides
+    which definition applies.
     """
     entries = []
-    seen = {}
 
     for number, raw in enumerate(text.splitlines(), start=1):
         line = raw.strip()
@@ -139,23 +188,7 @@ def parse_config(text, path, warn=True):
         if not match:
             raise HushError(invalid_line_message(line, number, path))
 
-        label = match.group(1).upper()
-        secret = match.group(2)
-
-        # lower() matches how the regex compares case; casefold() would
-        # treat secrets the regex sees as different (e.g. ß vs SS) as
-        # duplicates and drop one.
-        key = secret.lower()
-        if key in seen:
-            if warn:
-                info(
-                    f"WARNING: duplicate secret on line {number} ignored "
-                    f"(first defined on line {seen[key]})."
-                )
-            continue
-        seen[key] = number
-
-        entries.append((secret, label))
+        entries.append((match.group(2), match.group(1).upper(), number))
 
     return entries
 
@@ -166,15 +199,53 @@ def replacement_for(label):
     return f"<REDACTED-{label}>"
 
 
-def load_secrets():
-    path = get_secrets_file()
-    warn_if_exposed(path)
+def warn_duplicate(previous, label, path, number):
+    # Never include the secret itself.
+    _, old_label, old_path, old_number = previous
 
-    entries = parse_config(read_config(path), path)
-    if not entries:
-        raise HushError(f"No secrets defined in {path}")
+    change = ""
+    if old_label != label:
+        change = f" ({replacement_for(old_label)} -> {replacement_for(label)})"
 
-    secrets = [(secret, replacement_for(label)) for secret, label in entries]
+    if old_path == path:
+        info(
+            f"WARNING: duplicate secret on line {number} of {path} "
+            f"(also on line {old_number}); line {number} applies{change}."
+        )
+    elif old_label != label:
+        info(
+            f"WARNING: line {number} of {path} overrides line {old_number} "
+            f"of {old_path}{change}."
+        )
+
+
+def load_secrets(no_global=False):
+    files = secrets_files(no_global)
+
+    # key -> (secret, LABEL, path, line_number). The last definition wins.
+    # lower() matches how the regex compares case; casefold() would treat
+    # secrets the regex sees as different (e.g. ß vs SS) as duplicates.
+    merged = {}
+
+    for path in files:
+        warn_if_exposed(path)
+        for secret, label, number in parse_config(read_config(path), path):
+            key = secret.lower()
+            if key in merged:
+                warn_duplicate(merged[key], label, path, number)
+            merged[key] = (secret, label, path, number)
+
+    if not merged:
+        if len(files) == 1:
+            raise HushError(f"No secrets defined in {files[0]}")
+        raise HushError(
+            "No secrets defined in any of the loaded secrets files "
+            "(list them with: hush --files)."
+        )
+
+    secrets = [
+        (secret, replacement_for(label)) for secret, label, _, _ in merged.values()
+    ]
 
     # Longer secrets first, so they win over secrets they contain.
     secrets.sort(key=lambda item: len(item[0]), reverse=True)
@@ -183,8 +254,8 @@ def load_secrets():
 
 def write_config(path, content):
     """
-    Replace the secrets file atomically: write a temporary file in the
-    same directory, flush it to disk, then rename it over the original.
+    Replace a secrets file atomically: write a temporary file in the same
+    directory, flush it to disk, then rename it over the original.
     Symlinks are followed, so a linked file is updated in place.
     """
     target = path.resolve()
@@ -345,10 +416,25 @@ def clipboard_verify(paste, expected, attempts=10, delay=0.05):
 # --------------------------------------------------
 
 def write_stdout(text, ensure_newline=False):
+    """Write text to stdout and return exactly what was written."""
     if ensure_newline and text and not text.endswith("\n"):
         text += "\n"
     sys.stdout.buffer.write(text.encode(ENCODING, ERRORS))
     sys.stdout.flush()
+    return text
+
+
+def separate_messages(written, quiet):
+    """
+    When output goes to a terminal, put a blank line between it and the
+    messages that follow. This goes to stderr, so piped or redirected
+    output is never changed.
+    """
+    if quiet or not sys.stdout.isatty():
+        return
+    gap = "\n" if written and not written.endswith("\n") else ""
+    sys.stderr.write(gap + "\n")
+    sys.stderr.flush()
 
 
 # --------------------------------------------------
@@ -365,8 +451,8 @@ def run_redact(argv):
             "  hush add    add secrets without printing them "
             "(see: hush add --help)\n"
             "\n"
-            f"secrets file: ${ENV_VARIABLE} if set, "
-            f"otherwise {default_secrets_file()}"
+            f"secrets files: {global_secrets_file()} (unless --no-global),\n"
+            f"then each file in ${FILES_VARIABLE} (colon-separated)"
         ),
     )
     parser.add_argument(
@@ -382,9 +468,22 @@ def run_redact(argv):
         help="don't print the redaction summary",
     )
     parser.add_argument(
+        "--no-global", action="store_true",
+        help=f"don't load the global secrets file; use only ${FILES_VARIABLE}",
+    )
+    parser.add_argument(
+        "--files", action="store_true",
+        help="print the secrets files that would be loaded, one per line",
+    )
+    parser.add_argument(
         "--version", action="version", version=f"hush {VERSION}",
     )
     args = parser.parse_args(argv)
+
+    if args.files:
+        for path in secrets_files(args.no_global):
+            write_stdout(f"{path}\n")
+        return 0
 
     if args.preview and not args.clipboard:
         parser.error("--preview requires --clipboard")
@@ -397,7 +496,7 @@ def run_redact(argv):
 
     # Load and validate configuration before touching any input,
     # so a config problem never lets text through unredacted.
-    secrets = load_secrets()
+    secrets = load_secrets(args.no_global)
     pattern = build_pattern(secrets)
 
     if args.clipboard:
@@ -406,7 +505,8 @@ def run_redact(argv):
         result, counts = redact(text, secrets, pattern)
 
         if args.preview:
-            write_stdout(result, ensure_newline=True)
+            written = write_stdout(result, ensure_newline=True)
+            separate_messages(written, args.quiet)
             report(counts, args.quiet)
             if not args.quiet:
                 info("preview only; clipboard was NOT modified.")
@@ -419,7 +519,8 @@ def run_redact(argv):
     else:
         text = sys.stdin.buffer.read().decode(ENCODING, ERRORS)
         result, counts = redact(text, secrets, pattern)
-        write_stdout(result)
+        written = write_stdout(result)
+        separate_messages(written, args.quiet)
         report(counts, args.quiet)
 
     return 0
@@ -476,7 +577,7 @@ def run_add(argv):
     parser = argparse.ArgumentParser(
         prog="hush add",
         description=(
-            "Add secrets to the secrets file without printing them. Reads one "
+            "Add secrets to a secrets file without printing them. Reads one "
             "secret per line from stdin, or prompts with hidden input when "
             "run in a terminal. Tab-separated values on one line are added "
             "as separate secrets."
@@ -485,6 +586,10 @@ def run_add(argv):
     parser.add_argument(
         "-l", "--label", default="redacted",
         help="label for the new secrets (default: redacted, giving <REDACTED>)",
+    )
+    parser.add_argument(
+        "--file", metavar="PATH",
+        help="secrets file to add to (default: the global secrets file)",
     )
     parser.add_argument(
         "--note",
@@ -514,11 +619,18 @@ def run_add(argv):
         if note.splitlines() != [note]:
             parser.error("--note must be a single line")
 
+    if args.file is not None:
+        path = Path(args.file).expanduser()
+        source = "--file"
+    else:
+        path = global_secrets_file()
+        source = "global"
+
     # Validate the file before reading or prompting for any secret.
-    path = get_secrets_file()
+    check_file(path, source)
     warn_if_exposed(path)
     text = read_config(path)
-    existing = {secret.lower() for secret, _ in parse_config(text, path)}
+    existing = {secret.lower() for secret, _, _ in parse_config(text, path)}
 
     values = split_values(read_add_input(), split_tabs=not args.no_split)
     if not values:
@@ -560,7 +672,7 @@ def run_add(argv):
 
     # Confirm the new file parses and holds every new secret under the
     # right label before replacing the original.
-    parsed = dict(parse_config(content, path, warn=False))
+    parsed = {secret: lbl for secret, lbl, _ in parse_config(content, path)}
     if any(parsed.get(value) != label.upper() for value in new):
         raise HushError("Internal check failed. The secrets file was not changed.")
 
@@ -576,6 +688,14 @@ def run_add(argv):
     if skipped:
         message += f" ({skipped} already present)"
     info(message)
+
+    if args.file is not None and not is_loaded(path):
+        info(
+            f"note: {path} is not loaded (it isn't the global file or listed "
+            f"in {FILES_VARIABLE}), so these secrets won't be redacted until "
+            f"it is."
+        )
+
     return 0
 
 

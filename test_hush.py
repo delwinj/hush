@@ -5,7 +5,6 @@ import contextlib
 import importlib.util
 import io
 import os
-import re
 import select
 import shlex
 import subprocess
@@ -34,9 +33,16 @@ class HushTestCase(unittest.TestCase):
         self.tmp = Path(self._tmp.name)
         self.empty_bin = self.tmp / "empty-bin"
         self.empty_bin.mkdir()
+        self.global_file = self.tmp / "config" / "hush" / "secrets.txt"
 
-    def write_config(self, content, name="secrets.txt", mode=0o600):
-        path = self.tmp / name
+    def base_env(self, **extra):
+        # Built from scratch, so nothing from the real environment leaks in.
+        env = {"HOME": str(self.tmp), "XDG_CONFIG_HOME": str(self.tmp / "config")}
+        env.update(extra)
+        return env
+
+    def write_file(self, path, content, mode=0o600):
+        path.parent.mkdir(parents=True, exist_ok=True)
         if isinstance(content, bytes):
             path.write_bytes(content)
         else:
@@ -44,10 +50,17 @@ class HushTestCase(unittest.TestCase):
         path.chmod(mode)
         return path
 
-    def load(self, content):
-        path = self.write_config(content)
-        with mock.patch.dict(os.environ, {"HUSH_SECRETS_FILE": str(path)}):
-            return hush.load_secrets()
+    def write_global(self, content, mode=0o600):
+        return self.write_file(self.global_file, content, mode)
+
+    def write_extra(self, name, content, mode=0o600):
+        return self.write_file(self.tmp / name, content, mode)
+
+    def load(self, content=None, no_global=False, **env):
+        if content is not None:
+            self.write_global(content)
+        with mock.patch.dict(os.environ, self.base_env(**env), clear=True):
+            return hush.load_secrets(no_global=no_global)
 
     def redact(self, content, text):
         secrets = self.load(content)
@@ -56,16 +69,35 @@ class HushTestCase(unittest.TestCase):
     def redacted(self, content, text):
         return self.redact(content, text)[0]
 
-    def run_cli(self, args=(), input=b"", env=None):
-        full_env = {"HOME": str(self.tmp), "PATH": str(self.empty_bin)}
+    def cli_env(self, env):
+        full_env = self.base_env(PATH=str(self.empty_bin))
         full_env.update(env or {})
+        return full_env
+
+    def run_cli(self, args=(), input=b"", env=None):
         return subprocess.run(
             [sys.executable, str(SCRIPT), *args],
             input=input,
             capture_output=True,
-            env=full_env,
+            env=self.cli_env(env),
             timeout=20,
         )
+
+    def run_cli_tty_stdout(self, args=(), input=b"", env=None):
+        """Run hush with stdout on a pseudo-terminal; returns stderr."""
+        master, slave = os.openpty()
+        try:
+            return subprocess.run(
+                [sys.executable, str(SCRIPT), *args],
+                input=input,
+                stdout=slave,
+                stderr=subprocess.PIPE,
+                env=self.cli_env(env),
+                timeout=20,
+            )
+        finally:
+            os.close(slave)
+            os.close(master)
 
 
 # --------------------------------------------------
@@ -155,13 +187,20 @@ class FormatTests(HushTestCase):
                 self.load(content)
             self.assertNotIn("zq7hunter2", str(ctx.exception))
 
-    def test_duplicates_ignored_with_warning(self):
+    def test_duplicate_in_file_last_wins_with_warning(self):
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
             secrets = self.load("redacted: zq7secret\nemail: ZQ7SECRET\n")
         self.assertEqual(len(secrets), 1)
+        self.assertEqual(secrets[0][1], "<REDACTED-EMAIL>")
         self.assertIn("duplicate", stderr.getvalue())
         self.assertNotIn("zq7secret", stderr.getvalue().lower())
+
+    def test_duplicate_in_file_same_label_still_warns(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.load("redacted: abcdef\nredacted: ABCDEF\n")
+        self.assertIn("duplicate", stderr.getvalue())
 
     def test_case_distinct_secrets_both_kept(self):
         self.assertEqual(len(self.load("redacted: straße\nredacted: STRASSE\n")), 2)
@@ -262,81 +301,202 @@ class MatchingTests(HushTestCase):
 
 
 # --------------------------------------------------
-# Secrets file location and access
+# Which files are loaded
 # --------------------------------------------------
 
-class LocationTests(HushTestCase):
-    def test_env_file_missing(self):
-        missing = self.tmp / "nope.txt"
-        with mock.patch.dict(os.environ, {"HUSH_SECRETS_FILE": str(missing)}):
-            with self.assertRaises(hush.HushError) as ctx:
-                hush.get_secrets_file()
-        self.assertIn("HUSH_SECRETS_FILE", str(ctx.exception))
-        self.assertIn(str(missing), str(ctx.exception))
+class FilesTests(HushTestCase):
+    def setUp(self):
+        super().setUp()
+        self.write_global("redacted: abcdef\n")
+        self.a = self.write_extra("a.txt", "redacted: aaa111\n")
+        self.b = self.write_extra("b.txt", "redacted: bbb222\n")
 
-    def test_env_empty(self):
-        with mock.patch.dict(os.environ, {"HUSH_SECRETS_FILE": "  "}):
-            with self.assertRaises(hush.HushError) as ctx:
-                hush.get_secrets_file()
-        self.assertIn("set but empty", str(ctx.exception))
+    def files(self, value=None, no_global=False, **env):
+        if value is not None:
+            env["HUSH_SECRETS_FILES"] = value
+        with mock.patch.dict(os.environ, self.base_env(**env), clear=True):
+            return hush.secrets_files(no_global)
 
-    def test_env_points_to_directory(self):
-        with mock.patch.dict(os.environ, {"HUSH_SECRETS_FILE": str(self.tmp)}):
-            with self.assertRaises(hush.HushError) as ctx:
-                hush.get_secrets_file()
-        self.assertIn("not a regular file", str(ctx.exception))
+    def assert_error(self, expected, value=None, no_global=False, **env):
+        with self.assertRaises(hush.HushError) as ctx:
+            self.files(value, no_global, **env)
+        self.assertIn(expected, str(ctx.exception))
+        return str(ctx.exception)
 
-    def test_default_missing(self):
-        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.tmp)}):
-            os.environ.pop("HUSH_SECRETS_FILE", None)
-            with self.assertRaises(hush.HushError) as ctx:
-                hush.get_secrets_file()
-        message = str(ctx.exception)
-        self.assertIn("default location", message)
-        self.assertIn(str(self.tmp / "hush" / "secrets.txt"), message)
+    def test_global_only(self):
+        self.assertEqual(self.files(), [self.global_file])
 
-    def test_default_found(self):
-        expected = self.tmp / "hush" / "secrets.txt"
-        expected.parent.mkdir()
-        expected.write_text("redacted: abc\n")
-        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.tmp)}):
-            os.environ.pop("HUSH_SECRETS_FILE", None)
-            self.assertEqual(hush.get_secrets_file(), expected)
+    def test_global_missing(self):
+        self.global_file.unlink()
+        message = self.assert_error("Secrets file not found (global)")
+        self.assertIn(str(self.global_file), message)
+
+    def test_global_without_xdg_uses_home_config(self):
+        with mock.patch.dict(os.environ, {"HOME": str(self.tmp)}, clear=True):
+            self.assertEqual(
+                hush.global_secrets_file(),
+                self.tmp / ".config" / "hush" / "secrets.txt",
+            )
+
+    def test_load_order(self):
+        self.assertEqual(
+            self.files(f"{self.a}:{self.b}"), [self.global_file, self.a, self.b]
+        )
+
+    def test_global_listed_in_variable_is_ignored(self):
+        self.assertEqual(
+            self.files(f"{self.b}:{self.global_file}:{self.a}"),
+            [self.global_file, self.b, self.a],
+        )
+
+    def test_repeated_entry_loads_at_first_position(self):
+        self.assertEqual(
+            self.files(f"{self.a}:{self.b}:{self.a}"),
+            [self.global_file, self.a, self.b],
+        )
+
+    def test_symlink_to_listed_file_loads_once(self):
+        link = self.tmp / "link.txt"
+        link.symlink_to(self.a)
+        self.assertEqual(
+            self.files(f"{self.a}:{link}"), [self.global_file, self.a]
+        )
 
     def test_tilde_expanded(self):
-        path = self.write_config("redacted: abc\n", name="s.txt")
-        env = {"HOME": str(self.tmp), "HUSH_SECRETS_FILE": "~/s.txt"}
-        with mock.patch.dict(os.environ, env):
-            self.assertEqual(hush.get_secrets_file(), path)
+        self.assertEqual(self.files("~/a.txt"), [self.global_file, self.a])
+
+    def test_whitespace_around_entries(self):
+        self.assertEqual(
+            self.files(f" {self.a} : {self.b} "),
+            [self.global_file, self.a, self.b],
+        )
+
+    def test_relative_entry_rejected(self):
+        self.assert_error("absolute", "a.txt")
+
+    def test_unexpanded_variable_rejected(self):
+        self.assert_error("absolute", "$HOME/a.txt")
+
+    def test_empty_entry_rejected(self):
+        for value in (f"{self.a}::{self.b}", f"{self.a}:", f":{self.a}"):
+            self.assert_error("empty entry", value)
+
+    def test_empty_variable_rejected(self):
+        self.assert_error("set but empty", "   ")
+
+    def test_missing_listed_file(self):
+        missing = self.tmp / "nope.txt"
+        message = self.assert_error(
+            "Secrets file not found (HUSH_SECRETS_FILES)", str(missing)
+        )
+        self.assertIn(str(missing), message)
+
+    def test_listed_directory(self):
+        self.assert_error("not a regular file", str(self.tmp))
+
+    def test_no_global(self):
+        self.global_file.unlink()
+        self.assertEqual(self.files(str(self.a), no_global=True), [self.a])
+
+    def test_no_global_with_global_listed(self):
+        self.assertEqual(
+            self.files(f"{self.a}:{self.global_file}", no_global=True),
+            [self.a, self.global_file],
+        )
+
+    def test_no_global_without_variable(self):
+        self.assert_error("--no-global", no_global=True)
+
+    def test_old_variable_ignored(self):
+        self.assertEqual(
+            self.files(HUSH_SECRETS_FILE=str(self.tmp / "nope.txt")),
+            [self.global_file],
+        )
 
     @unittest.skipIf(IS_ROOT, "root can read any file")
-    def test_unreadable_file(self):
-        path = self.write_config("redacted: abc\n", mode=0o000)
-        self.addCleanup(path.chmod, 0o600)
-        with mock.patch.dict(os.environ, {"HUSH_SECRETS_FILE": str(path)}):
-            with self.assertRaises(hush.HushError) as ctx:
-                hush.load_secrets()
+    def test_unreadable_listed_file(self):
+        locked = self.write_extra("locked.txt", "redacted: abcdef\n", mode=0o000)
+        self.addCleanup(locked.chmod, 0o600)
+        with self.assertRaises(hush.HushError) as ctx:
+            self.load(HUSH_SECRETS_FILES=str(locked))
         self.assertIn("Unable to read", str(ctx.exception))
 
     @unittest.skipIf(IS_ROOT, "root can read any directory")
     def test_inaccessible_parent_directory(self):
         locked = self.tmp / "locked"
         locked.mkdir()
-        (locked / "secrets.txt").write_text("redacted: abc\n")
+        (locked / "s.txt").write_text("redacted: abcdef\n")
         locked.chmod(0o000)
         self.addCleanup(locked.chmod, 0o700)
-        target = str(locked / "secrets.txt")
-        with mock.patch.dict(os.environ, {"HUSH_SECRETS_FILE": target}):
-            with self.assertRaises(hush.HushError):
-                hush.get_secrets_file()
+        with self.assertRaises(hush.HushError):
+            self.files(str(locked / "s.txt"))
 
     def test_exposed_file_warning(self):
-        path = self.write_config("redacted: abc\n", mode=0o644)
+        self.global_file.chmod(0o644)
         stderr = io.StringIO()
-        with mock.patch.dict(os.environ, {"HUSH_SECRETS_FILE": str(path)}):
-            with contextlib.redirect_stderr(stderr):
-                hush.load_secrets()
+        with contextlib.redirect_stderr(stderr):
+            self.load()
         self.assertIn("accessible by other users", stderr.getvalue())
+
+    def test_empty_listed_file_allowed(self):
+        empty = self.write_extra("empty.txt", "# nothing yet\n")
+        self.assertEqual(len(self.load(HUSH_SECRETS_FILES=str(empty))), 1)
+
+    def test_all_files_empty_is_error(self):
+        self.write_global("# nothing\n")
+        empty = self.write_extra("empty.txt", "")
+        with self.assertRaises(hush.HushError) as ctx:
+            self.load(HUSH_SECRETS_FILES=str(empty))
+        self.assertIn("No secrets defined in any", str(ctx.exception))
+
+
+# --------------------------------------------------
+# Duplicates across files
+# --------------------------------------------------
+
+class OverrideTests(HushTestCase):
+    def load_files(self, global_content, *extras, order=None):
+        self.write_global(global_content)
+        paths = [
+            self.write_extra(f"extra{i}.txt", content)
+            for i, content in enumerate(extras)
+        ]
+        if order is not None:
+            paths = [paths[i] for i in order]
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            secrets = self.load(HUSH_SECRETS_FILES=":".join(map(str, paths)))
+        return dict(secrets), stderr.getvalue()
+
+    def test_later_file_overrides(self):
+        secrets, stderr = self.load_files(
+            "redacted: 123456789012\n", "aws-account-id: 123456789012\n"
+        )
+        self.assertEqual(secrets["123456789012"], "<REDACTED-AWS-ACCOUNT-ID>")
+        self.assertIn("overrides", stderr)
+        self.assertIn(str(self.global_file), stderr)
+        self.assertIn(str(self.tmp / "extra0.txt"), stderr)
+        self.assertNotIn("123456789012", stderr)
+
+    def test_later_file_wins_even_with_plain_label(self):
+        secrets, stderr = self.load_files(
+            "aws-account-id: 123456789012\n", "redacted: 123456789012\n"
+        )
+        self.assertEqual(secrets["123456789012"], "<REDACTED>")
+        self.assertIn("overrides", stderr)
+
+    def test_same_label_across_files_is_silent(self):
+        secrets, stderr = self.load_files(
+            "email: john@example.com\n", "email: JOHN@example.com\n"
+        )
+        self.assertEqual(len(secrets), 1)
+        self.assertEqual(stderr, "")
+
+    def test_order_follows_variable(self):
+        secrets, _ = self.load_files(
+            "redacted: unrelated1\n", "x: 999999\n", "y: 999999\n", order=[1, 0]
+        )
+        self.assertEqual(secrets["999999"], "<REDACTED-X>")
 
 
 # --------------------------------------------------
@@ -346,49 +506,104 @@ class LocationTests(HushTestCase):
 class PipeCliTests(HushTestCase):
     def setUp(self):
         super().setUp()
-        config = self.write_config("email: john@example.com\nip: 10.10.10.15\n")
-        self.env = {"HUSH_SECRETS_FILE": str(config)}
+        self.write_global("email: john@example.com\nip: 10.10.10.15\n")
+        self.extra = self.write_extra("work.txt", "redacted: worksecret1\n")
 
     def test_redacts_stdin(self):
-        proc = self.run_cli(
-            input=b"Contact JOHN@example.com at 10.10.10.15\n", env=self.env
-        )
+        proc = self.run_cli(input=b"Contact JOHN@example.com at 10.10.10.15\n")
         self.assertEqual(proc.returncode, 0)
         self.assertEqual(
             proc.stdout, b"Contact <REDACTED-EMAIL> at <REDACTED-IP>\n"
         )
-        self.assertIn(b"redacted 2:", proc.stderr)
+        self.assertTrue(proc.stderr.startswith(b"hush: redacted 2:"))
 
-    def test_quiet(self):
-        proc = self.run_cli(["-q"], input=b"john@example.com", env=self.env)
-        self.assertEqual(proc.returncode, 0)
-        self.assertEqual(proc.stderr, b"")
+    def test_extra_file_via_variable(self):
+        proc = self.run_cli(
+            input=b"john@example.com worksecret1",
+            env={"HUSH_SECRETS_FILES": str(self.extra)},
+        )
+        self.assertEqual(proc.stdout, b"<REDACTED-EMAIL> <REDACTED>")
 
-    def test_no_match_message(self):
-        proc = self.run_cli(input=b"nothing", env=self.env)
-        self.assertEqual(proc.stdout, b"nothing")
-        self.assertIn(b"no configured secrets found", proc.stderr)
+    def test_no_global(self):
+        proc = self.run_cli(
+            ["--no-global"],
+            input=b"john@example.com worksecret1",
+            env={"HUSH_SECRETS_FILES": str(self.extra)},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, b"john@example.com <REDACTED>")
 
-    def test_config_error_outputs_nothing(self):
-        env = {"HUSH_SECRETS_FILE": str(self.tmp / "nope.txt")}
-        proc = self.run_cli(input=b"john@example.com\n", env=env)
+    def test_no_global_without_variable(self):
+        proc = self.run_cli(["--no-global"], input=b"x")
         self.assertEqual(proc.returncode, 1)
         self.assertEqual(proc.stdout, b"")
-        self.assertIn(b"Secrets file not found (HUSH_SECRETS_FILE)", proc.stderr)
-        self.assertIn(str(self.tmp / "nope.txt").encode(), proc.stderr)
 
-    def test_invalid_file_outputs_nothing(self):
-        config = self.write_config("[email]\njohn@example.com\n", name="old.txt")
+    def test_files_one_per_line(self):
         proc = self.run_cli(
-            input=b"john@example.com\n", env={"HUSH_SECRETS_FILE": str(config)}
+            ["--files"], env={"HUSH_SECRETS_FILES": str(self.extra)}
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            proc.stdout, f"{self.global_file}\n{self.extra}\n".encode()
+        )
+
+    def test_files_with_no_global(self):
+        proc = self.run_cli(
+            ["--files", "--no-global"],
+            env={"HUSH_SECRETS_FILES": str(self.extra)},
+        )
+        self.assertEqual(proc.stdout, f"{self.extra}\n".encode())
+
+    def test_files_fails_on_missing_file(self):
+        proc = self.run_cli(
+            ["--files"], env={"HUSH_SECRETS_FILES": str(self.tmp / "nope.txt")}
         )
         self.assertEqual(proc.returncode, 1)
         self.assertEqual(proc.stdout, b"")
 
+    def test_quiet(self):
+        proc = self.run_cli(["-q"], input=b"john@example.com")
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stderr, b"")
+
+    def test_no_match_message(self):
+        proc = self.run_cli(input=b"nothing")
+        self.assertEqual(proc.stdout, b"nothing")
+        self.assertIn(b"no configured secrets found", proc.stderr)
+
+    def test_config_error_outputs_nothing(self):
+        missing = self.tmp / "nope.txt"
+        proc = self.run_cli(
+            input=b"john@example.com\n", env={"HUSH_SECRETS_FILES": str(missing)}
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stdout, b"")
+        self.assertIn(b"Secrets file not found (HUSH_SECRETS_FILES)", proc.stderr)
+        self.assertIn(str(missing).encode(), proc.stderr)
+
+    def test_invalid_file_outputs_nothing(self):
+        self.write_global("[email]\njohn@example.com\n")
+        proc = self.run_cli(input=b"john@example.com\n")
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stdout, b"")
+
     def test_non_utf8_passes_through(self):
-        proc = self.run_cli(input=b"\xff\xfe john@example.com\n", env=self.env)
+        proc = self.run_cli(input=b"\xff\xfe john@example.com\n")
         self.assertEqual(proc.returncode, 0)
         self.assertEqual(proc.stdout, b"\xff\xfe <REDACTED-EMAIL>\n")
+
+    def test_blank_line_before_messages_on_terminal(self):
+        proc = self.run_cli_tty_stdout(input=b"x john@example.com\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(proc.stderr.startswith(b"\nhush: redacted"), proc.stderr)
+
+    def test_missing_final_newline_completed_on_terminal(self):
+        proc = self.run_cli_tty_stdout(input=b"x john@example.com")
+        self.assertTrue(proc.stderr.startswith(b"\n\nhush: redacted"), proc.stderr)
+
+    def test_no_separator_when_quiet(self):
+        proc = self.run_cli_tty_stdout(["-q"], input=b"x john@example.com\n")
+        self.assertEqual(proc.stderr, b"")
 
     def test_tty_stdin_rejected(self):
         master, slave = os.openpty()
@@ -397,7 +612,7 @@ class PipeCliTests(HushTestCase):
                 [sys.executable, str(SCRIPT)],
                 stdin=slave,
                 capture_output=True,
-                env={"HOME": str(self.tmp), **self.env},
+                env=self.base_env(),
                 timeout=20,
             )
         finally:
@@ -407,7 +622,7 @@ class PipeCliTests(HushTestCase):
         self.assertIn(b"no input piped", proc.stderr)
 
     def test_preview_requires_clipboard(self):
-        proc = self.run_cli(["-p"], input=b"x", env=self.env)
+        proc = self.run_cli(["-p"], input=b"x")
         self.assertEqual(proc.returncode, 2)
 
     def test_version(self):
@@ -421,6 +636,8 @@ class PipeCliTests(HushTestCase):
         self.assertIn(b"hush add", proc.stdout)
 
     def test_broken_pipe_is_quiet(self):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("HUSH_")}
+        env.update(self.base_env())
         cmd = (
             f"{shlex.quote(sys.executable)} {shlex.quote(str(SCRIPT))} -q"
             " | head -c 1 > /dev/null"
@@ -430,7 +647,7 @@ class PipeCliTests(HushTestCase):
             shell=True,
             input=b"a" * 300_000,
             capture_output=True,
-            env={**os.environ, **self.env},
+            env=env,
             timeout=20,
         )
         self.assertNotIn(b"Traceback", proc.stderr)
@@ -479,12 +696,11 @@ class ClipboardCliTests(HushTestCase):
         self.clip.write_bytes(self.ORIGINAL)
         self.written_marker = Path(f"{self.clip}.written")
 
-        config = self.write_config("email: john@example.com\n")
+        self.write_global("email: john@example.com\n")
         self.env = {
             "PATH": f"{self.bin}:{SYSTEM_PATH}",
             "WAYLAND_DISPLAY": "fake-wayland",
             "FAKE_CLIP": str(self.clip),
-            "HUSH_SECRETS_FILE": str(config),
         }
 
     def make_tool(self, name, body):
@@ -505,6 +721,11 @@ class ClipboardCliTests(HushTestCase):
         self.assertEqual(self.clip.read_bytes(), self.ORIGINAL)
         self.assertFalse(self.written_marker.exists())
         self.assertIn(b"NOT modified", proc.stderr)
+
+    def test_preview_separated_on_terminal(self):
+        proc = self.run_cli_tty_stdout(["-c", "-p"], env=self.env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(proc.stderr.startswith(b"\nhush: "), proc.stderr)
 
     def test_no_match_does_not_write(self):
         self.clip.write_bytes(b"nothing secret")
@@ -557,7 +778,7 @@ class ClipboardCliTests(HushTestCase):
         self.assertEqual(self.clip.read_bytes(), self.REDACTED)
 
     def test_config_error_leaves_clipboard(self):
-        env = {**self.env, "HUSH_SECRETS_FILE": str(self.tmp / "nope.txt")}
+        env = {**self.env, "HUSH_SECRETS_FILES": str(self.tmp / "nope.txt")}
         proc = self.run_cli(["-c"], env=env)
         self.assertEqual(proc.returncode, 1)
         self.assertEqual(self.clip.read_bytes(), self.ORIGINAL)
@@ -573,17 +794,16 @@ class AddTests(HushTestCase):
 
     def setUp(self):
         super().setUp()
-        self.config = self.write_config(self.INITIAL)
-        self.env = {"HUSH_SECRETS_FILE": str(self.config)}
+        self.write_global(self.INITIAL)
 
     def add(self, data, *args, env=None):
-        return self.run_cli(["add", *args], input=data, env=env or self.env)
+        return self.run_cli(["add", *args], input=data, env=env)
 
-    def lines(self):
-        return self.config.read_text().splitlines()
+    def lines(self, path=None):
+        return (path or self.global_file).read_text().splitlines()
 
     def assert_unchanged(self):
-        self.assertEqual(self.config.read_text(), self.INITIAL)
+        self.assertEqual(self.global_file.read_text(), self.INITIAL)
 
     def test_default_label(self):
         proc = self.add(b"newsecret123\n")
@@ -598,7 +818,7 @@ class AddTests(HushTestCase):
         proc = self.add(b"newsecret123\n", "-l", "Password")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.lines()[-1], "password: newsecret123")
-        redact = self.run_cli(input=b"pw newsecret123", env=self.env)
+        redact = self.run_cli(input=b"pw newsecret123")
         self.assertEqual(redact.stdout, b"pw <REDACTED-PASSWORD>")
 
     def test_note_with_date(self):
@@ -635,7 +855,7 @@ class AddTests(HushTestCase):
         proc = self.add(b"firstpart\tsecondpart\n", "--no-split")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.lines()[-1], "redacted: firstpart\tsecondpart")
-        redact = self.run_cli(input=b"firstpart\tsecondpart", env=self.env)
+        redact = self.run_cli(input=b"firstpart\tsecondpart")
         self.assertEqual(redact.stdout, b"<REDACTED>")
 
     def test_multiple_lines(self):
@@ -706,7 +926,7 @@ class AddTests(HushTestCase):
         self.assert_unchanged()
 
     def test_file_without_trailing_newline(self):
-        self.config.write_text("email: john@example.com")
+        self.global_file.write_text("email: john@example.com")
         proc = self.add(b"newsecret123\n")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(
@@ -714,49 +934,97 @@ class AddTests(HushTestCase):
         )
 
     def test_file_with_only_comments(self):
-        self.config.write_text("# nothing yet\n")
+        self.global_file.write_text("# nothing yet\n")
         proc = self.add(b"newsecret123\n")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        redact = self.run_cli(input=b"newsecret123", env=self.env)
+        redact = self.run_cli(input=b"newsecret123")
         self.assertEqual(redact.stdout, b"<REDACTED>")
 
     def test_invalid_file_refused(self):
-        self.config.write_text("user:password\n")
+        self.global_file.write_text("user:password\n")
         proc = self.add(b"newsecret123\n")
         self.assertEqual(proc.returncode, 1)
-        self.assertEqual(self.config.read_text(), "user:password\n")
+        self.assertEqual(self.global_file.read_text(), "user:password\n")
 
     def test_old_format_file_refused(self):
-        self.config.write_text("[email]\njohn@example.com\n")
+        self.global_file.write_text("[email]\njohn@example.com\n")
         proc = self.add(b"newsecret123\n")
         self.assertEqual(proc.returncode, 1)
         self.assertIn(b"Section headers are no longer supported", proc.stderr)
 
-    def test_missing_file(self):
-        env = {"HUSH_SECRETS_FILE": str(self.tmp / "nope.txt")}
-        proc = self.add(b"newsecret123\n", env=env)
+    def test_missing_global_file(self):
+        self.global_file.unlink()
+        proc = self.add(b"newsecret123\n")
         self.assertEqual(proc.returncode, 1)
-        self.assertIn(b"Secrets file not found", proc.stderr)
-        self.assertFalse((self.tmp / "nope.txt").exists())
+        self.assertIn(b"Secrets file not found (global)", proc.stderr)
+        self.assertFalse(self.global_file.exists())
+
+    def test_file_option(self):
+        work = self.write_extra("work.txt", "# work\n")
+        proc = self.add(b"newsecret123\n", "--file", str(work))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.lines(work), ["# work", "redacted: newsecret123"])
+        self.assert_unchanged()
+
+    def test_file_option_not_loaded_note(self):
+        work = self.write_extra("work.txt", "# work\n")
+        proc = self.add(b"newsecret123\n", "--file", str(work))
+        self.assertIn(b"not loaded", proc.stderr)
+
+    def test_file_option_loaded_no_note(self):
+        work = self.write_extra("work.txt", "# work\n")
+        proc = self.add(
+            b"newsecret123\n", "--file", str(work),
+            env={"HUSH_SECRETS_FILES": str(work)},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn(b"not loaded", proc.stderr)
+
+    def test_file_option_tilde(self):
+        work = self.write_extra("work.txt", "# work\n")
+        proc = self.add(b"newsecret123\n", "--file", "~/work.txt")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.lines(work)[-1], "redacted: newsecret123")
+
+    def test_file_option_missing(self):
+        proc = self.add(b"newsecret123\n", "--file", str(self.tmp / "nope.txt"))
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(b"Secrets file not found (--file)", proc.stderr)
+
+    def test_variable_does_not_change_target(self):
+        work = self.write_extra("work.txt", "# work\n")
+        proc = self.add(b"newsecret123\n", env={"HUSH_SECRETS_FILES": str(work)})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.lines()[-1], "redacted: newsecret123")
+        self.assertEqual(self.lines(work), ["# work"])
+
+    def test_duplicates_checked_against_target_only(self):
+        work = self.write_extra("work.txt", "# work\n")
+        proc = self.add(b"john@example.com\n", "--file", str(work))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.lines(work)[-1], "redacted: john@example.com")
 
     def test_file_mode_becomes_600(self):
-        self.config.chmod(0o644)
+        self.global_file.chmod(0o644)
         proc = self.add(b"newsecret123\n")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(self.config.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.global_file.stat().st_mode & 0o777, 0o600)
 
     def test_symlink_preserved(self):
-        real = self.write_config("email: john@example.com\n", name="real.txt")
+        real = self.write_extra("real.txt", "email: john@example.com\n")
         link = self.tmp / "link.txt"
         link.symlink_to(real)
-        proc = self.add(b"newsecret123\n", env={"HUSH_SECRETS_FILE": str(link)})
+        proc = self.add(b"newsecret123\n", "--file", str(link))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertTrue(link.is_symlink())
         self.assertIn("redacted: newsecret123", real.read_text())
 
     def test_no_temporary_files_left(self):
         self.add(b"newsecret123\n")
-        leftovers = [p.name for p in self.tmp.iterdir() if p.name.startswith(".hush-")]
+        leftovers = [
+            p.name for p in self.global_file.parent.iterdir()
+            if p.name.startswith(".hush-")
+        ]
         self.assertEqual(leftovers, [])
 
     def test_never_prints_secrets(self):
@@ -781,7 +1049,7 @@ class AddTests(HushTestCase):
                 stdin=slave,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                env={"HOME": str(self.tmp), **self.env},
+                env=self.base_env(),
                 # No controlling terminal, so the prompt uses the pty
                 # instead of the terminal running the tests.
                 start_new_session=True,

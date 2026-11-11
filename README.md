@@ -18,10 +18,10 @@ on the clipboard, replaces every occurrence with a placeholder such as
 `<REDACTED>` or `<REDACTED-EMAIL>`, ready to paste.
 
 Matching is exact and case-insensitive: hush never guesses what might be
-sensitive, and it never uses a different secrets file than the one
-configured.
+sensitive, and it only reads the secrets files configured for it.
 
-Version 0.2.0. Upgrading from 0.1.0? See [Upgrading to 0.2.0](#upgrading-to-020).
+Changes between versions are listed in [CHANGELOG.md](CHANGELOG.md). When
+updating across a breaking change, see [Upgrading](#upgrading).
 
 ## Install
 
@@ -41,10 +41,10 @@ cd ~/src/hush
 ./install.sh
 ```
 
-The installer copies `hush.py` to `~/.local/bin/hush` and creates
-`~/.config/hush/secrets.txt` from `secrets.example.txt` if it doesn't exist.
-The directory is set to mode `700` and the file to `600`. Make sure
-`~/.local/bin` is in your `PATH`.
+The installer copies `hush.py` to `~/.local/bin/hush` and creates the global
+secrets file, `~/.config/hush/secrets.txt`, from `secrets.example.txt` if it
+doesn't exist. The directory is set to mode `700` and the file to `600`. Make
+sure `~/.local/bin` is in your `PATH`.
 
 To update, pull, run the tests, then reinstall:
 
@@ -52,11 +52,49 @@ To update, pull, run the tests, then reinstall:
 git pull && python3 -m unittest test_hush.py && ./install.sh
 ```
 
-## Secrets file
+## Secrets files
 
-hush reads `$HUSH_SECRETS_FILE` if it's set, otherwise
-`~/.config/hush/secrets.txt` (or `$XDG_CONFIG_HOME/hush/secrets.txt`). The
-file must exist; hush never falls back to another file.
+### Global file
+
+`~/.config/hush/secrets.txt` (or `$XDG_CONFIG_HOME/hush/secrets.txt`) is the
+global secrets file. It's always loaded and must exist.
+
+### Additional files
+
+`HUSH_SECRETS_FILES` lists more files to load after the global one, separated
+by colons:
+
+```bash
+export HUSH_SECRETS_FILES=~/.config/hush/aws.txt:~/.config/hush/lab.txt
+```
+
+- Each entry must be an absolute path or start with `~/`. hush expands `~`
+  itself, so it works inside quotes too. `$HOME` works when the shell expands
+  it (unquoted or in double quotes). Relative paths and empty entries (`::`,
+  or a leading or trailing `:`) are errors.
+- Every listed file must exist. A file may be empty, but the loaded files
+  together must contain at least one secret.
+- `--no-global` skips the global file and loads only the listed files.
+- `hush --files` prints the files that will be loaded, one per line, in load
+  order. It fails if any file is missing, so it also checks the configuration.
+
+### Load order and duplicates
+
+- The global file loads first, then each listed file in order. A file listed
+  more than once loads once, at its first position. If the global file is
+  listed, that entry is ignored, since the global file has already loaded.
+  With `--no-global`, the global file loads only if it's listed, at its
+  position in the list.
+- When the same secret (ignoring case) is defined more than once, the last
+  definition wins, whatever its label. List files from general to specific so
+  the more specific labels take precedence.
+- A duplicate within one file always produces a warning. Across files, a
+  warning appears only when the labels differ, naming both files and lines;
+  repeating a value with the same label is silent.
+
+The secret is redacted either way; precedence only decides its placeholder.
+
+### Format
 
 Each secret is one line:
 
@@ -79,13 +117,12 @@ password: pass=word:with#odd[chars
 - Lines starting with `#` are comments. Blank lines are ignored.
 - Whitespace around a line is ignored, so secrets can't start or end with
   spaces.
-- Duplicate secrets (ignoring case) are skipped with a warning.
-- Any other line is an error that stops hush. The error gives the line number,
-  never its content.
+- Any other line is an error that stops hush. The error gives the file and
+  line number, never the line's content.
 
-The file holds your secrets in plain text. Keep it at mode `600`, out of
+Secrets files hold secrets in plain text. Keep them at mode `600`, out of
 version control and out of shared backups. hush warns if other users can read
-it.
+one.
 
 ## Usage
 
@@ -100,9 +137,10 @@ some-command | hush | wl-copy          # redact, then copy the result
 
 Redacted text goes to stdout. A summary such as
 `hush: redacted 3: 2 <REDACTED-EMAIL>, 1 <REDACTED-IP>` goes to stderr; use
-`-q` to hide it.
+`-q` to hide it. When the output goes to a terminal, a blank line separates it
+from the summary.
 
-If the secrets file is missing or invalid, hush exits with an error and writes
+If a secrets file is missing or invalid, hush exits with an error and writes
 nothing to stdout, so text never passes through unredacted.
 
 ### Redact the clipboard
@@ -119,7 +157,7 @@ middle-click paste.
 
 ### Add secrets
 
-`hush add` adds secrets to the secrets file without printing them. Avoid
+`hush add` adds secrets to a secrets file without printing them. Avoid
 `echo`-ing a secret to copy it: printed text ends up in scrollback, logs and
 screen shares.
 
@@ -134,10 +172,17 @@ printf '%s\t%s\n' "$KEY_ID" "$SECRET" | hush add
 # At a hidden prompt
 hush add
 
-# With a label, or with a dated comment above the new entries
+# With a label, a dated comment, or into a specific file
 printf '%s\n' "$EMAIL" | hush add -l email
 printf '%s\n' "$SECRET" | hush add --note "SAA lab: alice access key"
+printf '%s\n' "$TOKEN" | hush add --file ~/.config/hush/work.txt
 ```
+
+Secrets go to the global file unless `--file` names another one.
+`HUSH_SECRETS_FILES` never changes the destination. If the `--file` target
+isn't loaded (it isn't the global file or listed in `HUSH_SECRETS_FILES`),
+hush adds the secrets and prints a note, since they won't be redacted until
+the file is listed.
 
 Input:
 
@@ -155,31 +200,19 @@ added:
 - Secrets under 6 characters are rejected unless you pass `--allow-short`.
   Short values get redacted inside unrelated words.
 - Secrets with leading or trailing whitespace are rejected.
-- Secrets already in the file are skipped and reported.
+- Secrets already in the target file are skipped and reported.
 
 New entries are appended to the end of the file. `--note` adds a blank line
 and a comment such as `# 2026-11-11: SAA lab: alice access key` above them.
 The note is visible in shell history, so never put a secret in it. The file is
 replaced atomically, symlinks are followed, and the mode is set to `600`.
 
-### Use a different secrets file
-
-`HUSH_SECRETS_FILE` selects the file for both redaction and `hush add`:
-
-```bash
-HUSH_SECRETS_FILE=~/.config/hush/work.txt hush -c
-printf '%s\n' "$TOKEN" | HUSH_SECRETS_FILE=~/.config/hush/work.txt hush add
-
-export HUSH_SECRETS_FILE=~/.config/hush/work.txt   # for the whole session
-```
-
-`hush add` works on an empty file; redaction needs at least one secret.
-
 ## Reference
 
 ```text
-hush [-c] [-p] [-q]
-hush add [-l LABEL] [--note TEXT] [--allow-short] [--no-split]
+hush [-c] [-p] [-q] [--no-global]
+hush --files [--no-global]
+hush add [-l LABEL] [--file PATH] [--note TEXT] [--allow-short] [--no-split]
 hush --version
 ```
 
@@ -188,10 +221,18 @@ hush --version
 | `-c`, `--clipboard` | Redact the clipboard in place. |
 | `-p`, `--preview` | With `-c`: print the result without changing the clipboard. |
 | `-q`, `--quiet` | Hide the summary and informational messages. Errors and warnings still print. |
+| `--no-global` | Don't load the global file; use only `HUSH_SECRETS_FILES`. |
+| `--files` | Print the files that would be loaded, one per line. |
 | `add -l`, `--label LABEL` | Label for new secrets. Default: `redacted`. |
+| `add --file PATH` | File to add to. Default: the global file. |
 | `add --note TEXT` | Dated comment written above the new secrets. |
 | `add --allow-short` | Allow secrets shorter than 6 characters. |
 | `add --no-split` | Don't split input lines on tabs. |
+
+| Environment variable | Meaning |
+| --- | --- |
+| `HUSH_SECRETS_FILES` | Colon-separated list of additional secrets files, loaded after the global file. |
+| `XDG_CONFIG_HOME` | Moves the global file to `$XDG_CONFIG_HOME/hush/secrets.txt`. |
 
 | Exit code | Meaning |
 | --- | --- |
@@ -237,7 +278,26 @@ With `ip: 10.10.10.15` and `redacted: mysecret`:
 - `hush add` doesn't detect the file being edited at the same time; the last
   write wins.
 
-## Upgrading to 0.2.0
+## Upgrading
+
+### To 0.3.0
+
+`HUSH_SECRETS_FILE` (singular) is no longer read, and hush doesn't warn if it's
+set. Previously it *replaced* the global file; now the global file always
+loads, and `HUSH_SECRETS_FILES` (plural) *adds* files to it.
+
+- Replace any `export HUSH_SECRETS_FILE=...` with
+  `export HUSH_SECRETS_FILES=...`. Until then, secrets in that file aren't
+  redacted.
+- To keep the old behavior of using only that file, add `--no-global`.
+- `hush add` now writes to the global file by default; use `--file` for
+  others.
+- When a secret is defined more than once, the last definition now wins
+  instead of the first.
+
+Check the result with `hush --files`.
+
+### To 0.2.0
 
 0.2.0 replaces section headers with one `label: secret` line per secret.
 Old files stop hush with
@@ -267,7 +327,7 @@ python3 -m unittest -v test_hush.py
 ```
 
 The tests use temporary files and fake clipboard tools, so they never touch
-your real clipboard or secrets file. After changing clipboard code, also check
+your real clipboard or secrets files. After changing clipboard code, also check
 by hand: copy text from a browser and a terminal, run `hush -c`, and paste.
 
 ## Uninstall
