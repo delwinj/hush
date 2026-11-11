@@ -5,6 +5,7 @@ import contextlib
 import importlib.util
 import io
 import os
+import re
 import select
 import shlex
 import subprocess
@@ -41,6 +42,11 @@ def read_until(stream, marker, timeout=10):
                 return data
             data += chunk
     return data
+
+
+def rule_re(title):
+    """Regex for a separator rule line, drawn with ─ or -."""
+    return rf"[─-]{{2}} {re.escape(title)} [─-]{{3,}}\n"
 
 
 class HushTestCase(unittest.TestCase):
@@ -532,6 +538,7 @@ class PipeCliTests(HushTestCase):
         self.assertEqual(
             proc.stdout, b"Contact <REDACTED-EMAIL> at <REDACTED-IP>\n"
         )
+        # Redirected output gets no decoration.
         self.assertTrue(proc.stderr.startswith(b"hush: redacted 2:"))
 
     def test_extra_file_via_variable(self):
@@ -609,18 +616,42 @@ class PipeCliTests(HushTestCase):
         self.assertEqual(proc.returncode, 0)
         self.assertEqual(proc.stdout, b"\xff\xfe <REDACTED-EMAIL>\n")
 
-    def test_blank_line_before_messages_on_terminal(self):
+    def test_end_rule_on_terminal(self):
         proc = self.run_cli_tty_stdout(input=b"x john@example.com\n")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertTrue(proc.stderr.startswith(b"\nhush: redacted"), proc.stderr)
+        self.assertRegex(
+            proc.stderr.decode(), r"\A\n" + rule_re("end") + r"hush: redacted"
+        )
 
     def test_missing_final_newline_completed_on_terminal(self):
         proc = self.run_cli_tty_stdout(input=b"x john@example.com")
-        self.assertTrue(proc.stderr.startswith(b"\n\nhush: redacted"), proc.stderr)
+        self.assertRegex(
+            proc.stderr.decode(), r"\A\n\n" + rule_re("end") + r"hush: redacted"
+        )
 
-    def test_no_separator_when_quiet(self):
+    def test_no_decoration_for_empty_input(self):
+        proc = self.run_cli_tty_stdout(input=b"")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(
+            proc.stderr.startswith(b"hush: no configured secrets found"),
+            proc.stderr,
+        )
+
+    def test_no_decoration_when_quiet(self):
         proc = self.run_cli_tty_stdout(["-q"], input=b"x john@example.com\n")
         self.assertEqual(proc.stderr, b"")
+
+    def test_rule_width_follows_terminal(self):
+        proc = self.run_cli_tty_stdout(
+            input=b"x john@example.com\n", env={"COLUMNS": "50"}
+        )
+        self.assertEqual(len(proc.stderr.decode().split("\n")[1]), 50)
+
+    def test_rule_width_capped(self):
+        proc = self.run_cli_tty_stdout(
+            input=b"x john@example.com\n", env={"COLUMNS": "200"}
+        )
+        self.assertEqual(len(proc.stderr.decode().split("\n")[1]), 80)
 
     def test_tty_stdin_rejected(self):
         master, slave = os.openpty()
@@ -823,6 +854,11 @@ class ClipboardCliTests(HushTestCase):
         self.assertEqual(self.clip.read_bytes(), self.REDACTED)
         self.assertIn(b"redacted 1:", proc.stderr)
 
+    def test_no_decoration_without_preview(self):
+        proc = self.run_cli_tty_stdout(["-c"], env=self.env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(proc.stderr.startswith(b"hush: redacted 1:"), proc.stderr)
+
     def test_preview_does_not_modify(self):
         proc = self.run_cli(["-c", "-n"], env=self.env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -831,10 +867,10 @@ class ClipboardCliTests(HushTestCase):
         self.assertFalse(self.clip_written.exists())
         self.assertIn(b"nothing was modified", proc.stderr)
 
-    def test_preview_separated_on_terminal(self):
+    def test_preview_framed_on_terminal(self):
         proc = self.run_cli_tty_stdout(["-cn"], env=self.env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertTrue(proc.stderr.startswith(b"\nhush: "), proc.stderr)
+        self.assertRegex(proc.stderr.decode(), r"\A\n" + rule_re("end") + r"hush: ")
 
     def test_no_match_does_not_write(self):
         self.clip.write_bytes(b"nothing secret")
@@ -966,6 +1002,7 @@ class ClipboardCliTests(HushTestCase):
         self.assertFalse(self.primary_written.exists())
 
     def test_preview_both_labelled(self):
+        # Not a terminal, so plain labels instead of rules.
         self.primary.write_bytes(self.PRIMARY)
         proc = self.run_cli(["-cpn"], env=self.env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -984,6 +1021,26 @@ class ClipboardCliTests(HushTestCase):
         self.assertIn(b"hush: primary selection:\n", proc.stderr)
         self.assertNotIn(b"redacted", proc.stderr)
         self.assertNotIn(b"nothing was modified", proc.stderr)
+
+    def test_preview_both_framed_on_terminal(self):
+        self.primary.write_bytes(self.PRIMARY)
+        proc = self.run_cli_tty_stdout(["-cpn"], env=self.env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertRegex(
+            proc.stderr.decode(),
+            r"\A" + rule_re("clipboard") + r"\n"
+            + rule_re("primary selection") + r"\n"
+            + rule_re("end") + r"hush: clipboard: redacted",
+        )
+
+    def test_preview_both_quiet_on_terminal(self):
+        self.primary.write_bytes(self.PRIMARY)
+        proc = self.run_cli_tty_stdout(["-cpnq"], env=self.env)
+        self.assertRegex(
+            proc.stderr.decode(),
+            r"\A" + rule_re("clipboard") + r"\n"
+            + rule_re("primary selection") + r"\n\Z",
+        )
 
     def test_primary_write_failure_after_clipboard(self):
         self.primary.write_bytes(self.PRIMARY)

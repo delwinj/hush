@@ -15,7 +15,7 @@ import time
 from collections import Counter
 from pathlib import Path
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 
 FILES_VARIABLE = "HUSH_SECRETS_FILES"
 DEFAULT_LABEL = "REDACTED"
@@ -31,6 +31,9 @@ SELECTION_NAMES = {"clipboard": "clipboard", "primary": "primary selection"}
 ENCODING = "utf-8"
 ERRORS = "surrogateescape"
 CLIPBOARD_TIMEOUT = 10
+
+# Separator rules fit the terminal, up to this width.
+MAX_RULE_WIDTH = 80
 
 
 class HushError(Exception):
@@ -461,12 +464,21 @@ def run_selections(args, secrets, pattern):
     labelled = len(blocks) > 1
 
     if args.preview:
+        decorate = decorate_output()
+        written = ""
         for name, result, _, _, _ in blocks:
             if labelled:
-                info(f"{name}:")
+                if decorate:
+                    write_rule(name)
+                else:
+                    info(f"{name}:")
             written = write_stdout(result, ensure_newline=True)
-            # With two blocks, the separators are needed to read the output.
-            separate_messages(written, args.quiet and not labelled)
+            if decorate and labelled:
+                end_section(written)
+        if decorate and blocks and not args.quiet:
+            if not labelled:
+                end_section(written)
+            write_rule("end")
     else:
         written_names = []
         for name, result, counts, paste, copy in blocks:
@@ -507,14 +519,32 @@ def write_stdout(text, ensure_newline=False):
     return text
 
 
-def separate_messages(written, quiet):
+def decorate_output():
+    """Frame output with rules only when it goes to a terminal."""
+    return sys.stdout.isatty()
+
+
+def rule_line(title):
+    width = min(shutil.get_terminal_size((40, 20)).columns, MAX_RULE_WIDTH)
+    char = "─"
+    try:
+        char.encode(sys.stderr.encoding or "ascii")
+    except (UnicodeEncodeError, LookupError):
+        char = "-"
+    head = f"{char * 2} {title} "
+    return head + char * max(width - len(head), 3)
+
+
+def write_rule(title):
+    sys.stderr.write(rule_line(title) + "\n")
+    sys.stderr.flush()
+
+
+def end_section(written):
     """
-    When output goes to a terminal, put a blank line between it and the
-    messages that follow. This goes to stderr, so piped or redirected
-    output is never changed.
+    End a block of output with a blank line, completing a missing final
+    newline first. This goes to stderr, so the output itself is unchanged.
     """
-    if quiet or not sys.stdout.isatty():
-        return
     gap = "\n" if written and not written.endswith("\n") else ""
     sys.stderr.write(gap + "\n")
     sys.stderr.flush()
@@ -536,7 +566,10 @@ def redact_stream(secrets, pattern, quiet):
         totals.update(counts)
         last = write_stdout(result)
 
-    separate_messages(last, quiet)
+    # `last` is empty only when no input arrived, so there's nothing to frame.
+    if decorate_output() and not quiet and last:
+        end_section(last)
+        write_rule("end")
     report(totals, quiet)
 
 

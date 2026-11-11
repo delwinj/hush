@@ -22,33 +22,49 @@ sensitive, and it only reads the secrets files configured for it.
 
 Changes between versions are listed in [CHANGELOG.md](CHANGELOG.md).
 
+## Contents
+
+- [Install](#install)
+- [Secrets files](#secrets-files)
+- [Usage](#usage)
+- [Reference](#reference)
+- [Matching rules](#matching-rules)
+- [Limitations](#limitations)
+- [Development](#development)
+- [Uninstall](#uninstall)
+
 ## Install
 
-Requires Linux with `python3` (standard library only). Clipboard modes need
-`wl-clipboard` on Wayland or `xclip` on X11:
+Developed and tested on Ubuntu 26.04.1 with Python 3.14.4. Other Linux
+distributions with a recent Python 3 and `wl-clipboard` or `xclip` will
+likely work, but haven't been tested. macOS, Windows and WSL aren't
+supported: their clipboards work differently.
+
+hush uses only the Python standard library. Clipboard modes need
+`wl-clipboard` on Wayland or `xclip` on X11. On Ubuntu:
 
 ```bash
 sudo apt install wl-clipboard   # if `echo $XDG_SESSION_TYPE` prints wayland
 sudo apt install xclip          # if it prints x11
 ```
 
-Install:
+Then clone the repository and run the installer:
 
 ```bash
-git clone <repo-url> ~/src/hush
+git clone https://github.com/delwinj/hush.git ~/src/hush
 cd ~/src/hush
 ./install.sh
 ```
 
 The installer copies `hush.py` to `~/.local/bin/hush` and creates the global
-secrets file, `~/.config/hush/secrets.txt`, from `secrets.example.txt` if it
-doesn't exist. The directory is set to mode `700` and the file to `600`. Make
-sure `~/.local/bin` is in your `PATH`.
+secrets file, `~/.config/hush/secrets.txt` (or under `$XDG_CONFIG_HOME` if
+set), from `secrets.example.txt` if it doesn't exist. The directory is set to
+mode `700` and the file to `600`. `~/.local/bin` must be in `PATH`.
 
 To update, pull, run the tests, then reinstall:
 
 ```bash
-git pull && python3 -m unittest test_hush.py && ./install.sh
+cd ~/src/hush && git pull && python3 -m unittest test_hush.py && ./install.sh
 ```
 
 ## Secrets files
@@ -112,7 +128,8 @@ password: pass=word:with#odd[chars
 - The secret is the rest of the line, exactly as written; nothing is escaped.
 - `redacted` gives `<REDACTED>`. Any other label gives `<REDACTED-LABEL>`,
   uppercased. A label tells readers what kind of value was removed, which is
-  also information, so use `redacted` unless the distinction helps.
+  also information, so `redacted` is the better choice unless the distinction
+  helps.
 - Lines starting with `#` are comments. Blank lines are ignored.
 - Whitespace around a line is ignored, so secrets can't start or end with
   spaces.
@@ -132,15 +149,16 @@ some-command | hush
 some-command 2>&1 | hush               # also redact error output
 hush < app.log > app.redacted.log      # redact a file
 tail -f app.log | hush                 # follow a log as it grows
-some-command | hush | wl-copy          # redact, then copy the result
+some-command | hush | wl-copy          # redact, then copy (X11: xclip -selection clipboard)
 ```
 
 Text is redacted and written line by line as it arrives, so following
 commands like `tail -f` or `kubectl logs -f` works. Redacted text goes to
 stdout. A summary such as
 `hush: redacted 3: 2 <REDACTED-EMAIL>, 1 <REDACTED-IP>` goes to stderr once
-the input ends; use `-q` to hide it. When the output goes to a terminal, a
-blank line separates it from the summary.
+the input ends; `-q` hides it. When the output goes to a terminal, it ends
+with a blank line and an `── end ──` rule before the summary, so it's clear
+where the text stops.
 
 If a secrets file is missing or invalid, hush exits with an error and writes
 nothing to stdout, so text never passes through unredacted.
@@ -170,8 +188,9 @@ hush -cpn      # preview both
   reported and skipped, since there's nothing to paste from it.
 
 `-n` prints the redacted text and changes nothing. With both selections, each
-block is labelled on stderr. To see only what would be redacted, discard the
-text and keep the summary: `hush -cn > /dev/null`.
+block is labelled: in a terminal with a rule naming it, otherwise with a
+`hush: clipboard:` line on stderr. To see only what would be redacted, discard
+the text and keep the summary: `hush -cn > /dev/null`.
 
 ### Add secrets
 
@@ -215,7 +234,7 @@ Validation happens before anything is written. If any value fails, nothing is
 added:
 
 - Empty input is an error. This catches unset variables.
-- Secrets under 6 characters are rejected unless you pass `--allow-short`.
+- Secrets under 6 characters are rejected unless `--allow-short` is given.
   Short values get redacted inside unrelated words.
 - Secrets with leading or trailing whitespace are rejected.
 - Secrets already in the target file are skipped and reported.
@@ -246,6 +265,8 @@ Short options can be combined in any order: `-cpn` is the same as
 | `-q`, `--quiet` | Hide the summary and informational messages. Errors, warnings and preview labels still print. |
 | `--no-global` | Don't load the global file; use only `HUSH_SECRETS_FILES`. |
 | `--files` | Print the files that would be loaded, one per line. |
+| `--version` | Print the version. |
+| `-h`, `--help` | Show help. `hush add --help` shows help for `add`. |
 | `add -l`, `--label LABEL` | Label for new secrets. Default: `redacted`. |
 | `add --file PATH` | File to add to. Default: the global file. |
 | `add --note TEXT` | Dated comment written above the new secrets. |
@@ -291,8 +312,10 @@ With `ip: 10.10.10.15` and `redacted: mysecret`:
 ## Limitations
 
 - Only listed secrets are redacted. New or rotated credentials pass through
-  until you add them.
-- Clipboard modes handle text only.
+  until they're added.
+- Clipboard modes handle text only, and need a graphical session (Wayland or
+  X11). In an SSH session there usually isn't one; pipe the remote output to
+  hush locally instead: `ssh host 'command' | hush`.
 - Clipboard managers may keep the unredacted original in their history.
 - `hush add` doesn't detect the file being edited at the same time; the last
   write wins.
@@ -304,7 +327,7 @@ python3 -m unittest -v test_hush.py
 ```
 
 The tests use temporary files and fake clipboard tools, so they never touch
-your real clipboard, primary selection or secrets files. After changing
+the real clipboard, primary selection or secrets files. After changing
 clipboard code, also check by hand: copy text from a browser and a terminal,
 run `hush -c` and `hush -p`, and paste with Ctrl+V and a middle click.
 
@@ -312,5 +335,6 @@ run `hush -c` and `hush -p`, and paste with Ctrl+V and a middle click.
 
 ```bash
 rm ~/.local/bin/hush
-rm -rf ~/.config/hush        # also deletes your secrets files
+rm -rf ~/src/hush            # the cloned repository
+rm -rf ~/.config/hush        # also deletes all secrets files
 ```

@@ -4,6 +4,17 @@ All notable changes to hush are documented here. Versions follow
 [Semantic Versioning](https://semver.org); while hush is below 1.0.0, minor
 versions may contain breaking changes.
 
+## [0.4.1] - 2026-11-12
+
+### Changed
+
+- When redacted text is printed to a terminal, each block now ends with a
+  blank line and a separator rule, replacing the single blank line, so the
+  end of the text is clear even when it contains blank lines. Previews of
+  both selections start each block with a rule naming it. Rules fit the
+  terminal width, up to 80 characters. Redirected output, in-place redaction
+  without a preview, and empty input get no rules.
+
 ## [0.4.0] - 2026-11-12
 
 ### Changed
