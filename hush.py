@@ -2,19 +2,27 @@
 """hush: redact configured secrets from piped input or the clipboard."""
 
 import argparse
+import datetime
+import getpass
 import os
 import re
 import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from collections import Counter
 from pathlib import Path
 
+VERSION = "0.2.0"
+
 ENV_VARIABLE = "HUSH_SECRETS_FILE"
 DEFAULT_LABEL = "REDACTED"
-SECTION_RE = re.compile(r"\[\s*([A-Za-z0-9_-]+)\s*\]")
+LABEL_RE = re.compile(r"[A-Za-z0-9_-]+")
+# A label, a colon, at least one whitespace character, then the secret.
+ENTRY_RE = re.compile(r"([A-Za-z0-9_-]+):\s+(.*)")
+MIN_ADD_LENGTH = 6
 
 # Round-trip any bytes, even invalid UTF-8, without crashing.
 ENCODING = "utf-8"
@@ -30,8 +38,12 @@ def info(message):
     print(f"hush: {message}", file=sys.stderr)
 
 
+def plural(count, word):
+    return f"{count} {word}{'' if count == 1 else 's'}"
+
+
 # --------------------------------------------------
-# Configuration
+# Secrets file location
 # --------------------------------------------------
 
 def default_secrets_file():
@@ -80,6 +92,74 @@ def warn_if_exposed(path):
         )
 
 
+# --------------------------------------------------
+# Secrets file format
+# --------------------------------------------------
+
+def read_config(path):
+    try:
+        # utf-8-sig drops a byte-order mark if an editor added one.
+        return path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError) as error:
+        raise HushError(f"Unable to read secrets file {path}: {error}")
+
+
+def invalid_line_message(line, number, path):
+    # Never include the line itself: it may contain a secret.
+    if line.startswith("[") and line.endswith("]"):
+        hint = (
+            "Section headers are no longer supported; put the label at the "
+            "start of each line. See 'Upgrading to 0.2.0' in the README."
+        )
+    else:
+        hint = (
+            "Expected 'label: secret' (a label, a colon, at least one space, "
+            "then the secret)."
+        )
+    return f"Invalid line {number} in {path}. {hint}"
+
+
+def parse_config(text, path, warn=True):
+    """
+    Parse secrets file text into a list of (secret, LABEL) pairs.
+
+    Blank lines and lines starting with # are ignored. Every other line
+    must be "label: secret". Duplicates (ignoring case) keep the first.
+    """
+    entries = []
+    seen = {}
+
+    for number, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+
+        if not line or line.startswith("#"):
+            continue
+
+        match = ENTRY_RE.fullmatch(line)
+        if not match:
+            raise HushError(invalid_line_message(line, number, path))
+
+        label = match.group(1).upper()
+        secret = match.group(2)
+
+        # lower() matches how the regex compares case; casefold() would
+        # treat secrets the regex sees as different (e.g. ß vs SS) as
+        # duplicates and drop one.
+        key = secret.lower()
+        if key in seen:
+            if warn:
+                info(
+                    f"WARNING: duplicate secret on line {number} ignored "
+                    f"(first defined on line {seen[key]})."
+                )
+            continue
+        seen[key] = number
+
+        entries.append((secret, label))
+
+    return entries
+
+
 def replacement_for(label):
     if label == DEFAULT_LABEL:
         return "<REDACTED>"
@@ -90,61 +170,39 @@ def load_secrets():
     path = get_secrets_file()
     warn_if_exposed(path)
 
-    try:
-        # utf-8-sig drops a byte-order mark if an editor added one.
-        lines = path.read_text(encoding="utf-8-sig").splitlines()
-    except (OSError, UnicodeDecodeError) as error:
-        raise HushError(f"Unable to read secrets file {path}: {error}")
-
-    secrets = []
-    seen = {}
-    label = DEFAULT_LABEL
-
-    for number, raw in enumerate(lines, start=1):
-        line = raw.strip()
-
-        if not line or line.startswith("#"):
-            continue
-
-        if line.startswith("\\"):
-            # Escaped line: everything after the backslash is the secret.
-            secret = line[1:]
-        elif line.startswith("[") and line.endswith("]"):
-            section = SECTION_RE.fullmatch(line)
-            if not section:
-                raise HushError(
-                    f"Invalid section header on line {number} of {path}. "
-                    f"Labels may contain only letters, digits, - and _. "
-                    f"To use this line as a secret, prefix it with \\"
-                )
-            label = section.group(1).upper()
-            continue
-        else:
-            secret = line
-
-        if not secret:
-            continue
-
-        # lower() matches how the regex compares case; casefold() would
-        # treat secrets the regex sees as different (e.g. ß vs SS) as
-        # duplicates and drop one.
-        key = secret.lower()
-        if key in seen:
-            info(
-                f"WARNING: duplicate secret on line {number} ignored "
-                f"(first defined on line {seen[key]})."
-            )
-            continue
-        seen[key] = number
-
-        secrets.append((secret, replacement_for(label)))
-
-    if not secrets:
+    entries = parse_config(read_config(path), path)
+    if not entries:
         raise HushError(f"No secrets defined in {path}")
+
+    secrets = [(secret, replacement_for(label)) for secret, label in entries]
 
     # Longer secrets first, so they win over secrets they contain.
     secrets.sort(key=lambda item: len(item[0]), reverse=True)
     return secrets
+
+
+def write_config(path, content):
+    """
+    Replace the secrets file atomically: write a temporary file in the
+    same directory, flush it to disk, then rename it over the original.
+    Symlinks are followed, so a linked file is updated in place.
+    """
+    target = path.resolve()
+    fd, tmp = tempfile.mkstemp(prefix=".hush-", suffix=".tmp", dir=target.parent)
+
+    try:
+        with os.fdopen(fd, "w", encoding=ENCODING, newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 # --------------------------------------------------
@@ -294,15 +352,20 @@ def write_stdout(text, ensure_newline=False):
 
 
 # --------------------------------------------------
-# Main
+# hush (redaction)
 # --------------------------------------------------
 
-def main():
+def run_redact(argv):
     parser = argparse.ArgumentParser(
         prog="hush",
         description="Redact configured secrets from piped input or the clipboard.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            f"Secrets file: ${ENV_VARIABLE} if set, "
+            "commands:\n"
+            "  hush add    add secrets without printing them "
+            "(see: hush add --help)\n"
+            "\n"
+            f"secrets file: ${ENV_VARIABLE} if set, "
             f"otherwise {default_secrets_file()}"
         ),
     )
@@ -318,7 +381,10 @@ def main():
         "-q", "--quiet", action="store_true",
         help="don't print the redaction summary",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--version", action="version", version=f"hush {VERSION}",
+    )
+    args = parser.parse_args(argv)
 
     if args.preview and not args.clipboard:
         parser.error("--preview requires --clipboard")
@@ -329,33 +395,202 @@ def main():
             "or use -c for the clipboard."
         )
 
-    try:
-        # Load and validate configuration before touching any input,
-        # so a config problem never lets text through unredacted.
-        secrets = load_secrets()
-        pattern = build_pattern(secrets)
+    # Load and validate configuration before touching any input,
+    # so a config problem never lets text through unredacted.
+    secrets = load_secrets()
+    pattern = build_pattern(secrets)
 
-        if args.clipboard:
-            paste, copy = clipboard_commands()
-            text = clipboard_read(paste)
-            result, counts = redact(text, secrets, pattern)
+    if args.clipboard:
+        paste, copy = clipboard_commands()
+        text = clipboard_read(paste)
+        result, counts = redact(text, secrets, pattern)
 
-            if args.preview:
-                write_stdout(result, ensure_newline=True)
-                report(counts, args.quiet)
-                if not args.quiet:
-                    info("preview only; clipboard was NOT modified.")
-            else:
-                if counts:
-                    clipboard_write(copy, result)
-                    clipboard_verify(paste, result)
-                report(counts, args.quiet)
-
-        else:
-            text = sys.stdin.buffer.read().decode(ENCODING, ERRORS)
-            result, counts = redact(text, secrets, pattern)
-            write_stdout(result)
+        if args.preview:
+            write_stdout(result, ensure_newline=True)
             report(counts, args.quiet)
+            if not args.quiet:
+                info("preview only; clipboard was NOT modified.")
+        else:
+            if counts:
+                clipboard_write(copy, result)
+                clipboard_verify(paste, result)
+            report(counts, args.quiet)
+
+    else:
+        text = sys.stdin.buffer.read().decode(ENCODING, ERRORS)
+        result, counts = redact(text, secrets, pattern)
+        write_stdout(result)
+        report(counts, args.quiet)
+
+    return 0
+
+
+# --------------------------------------------------
+# hush add
+# --------------------------------------------------
+
+def read_add_input():
+    """Return the raw text of the secrets to add. Never echoes it."""
+    if sys.stdin.isatty():
+        try:
+            return getpass.getpass("Secret (input hidden): ")
+        except EOFError:
+            return ""
+
+    data = sys.stdin.buffer.read()
+    try:
+        return data.decode(ENCODING)
+    except UnicodeDecodeError:
+        raise HushError("Input is not valid UTF-8. Nothing was added.")
+
+
+def split_values(text, split_tabs):
+    values = []
+    for line in text.splitlines():
+        values.extend(line.split("\t") if split_tabs else [line])
+    # Blank and whitespace-only values are ignored, like blank lines.
+    return [value for value in values if value.strip()]
+
+
+def validate_values(values, allow_short):
+    # Errors refer to secrets by position and length, never by content.
+    for index, value in enumerate(values, start=1):
+        if value != value.strip():
+            raise HushError(
+                f"Secret {index} has leading or trailing whitespace, which "
+                f"the secrets file can't store. Nothing was added."
+            )
+        if value.splitlines() != [value]:
+            raise HushError(
+                f"Secret {index} contains a line break. Nothing was added."
+            )
+        if len(value) < MIN_ADD_LENGTH and not allow_short:
+            raise HushError(
+                f"Secret {index} is {len(value)} characters; the minimum is "
+                f"{MIN_ADD_LENGTH}. Use --allow-short if this is intended. "
+                f"Nothing was added."
+            )
+
+
+def run_add(argv):
+    parser = argparse.ArgumentParser(
+        prog="hush add",
+        description=(
+            "Add secrets to the secrets file without printing them. Reads one "
+            "secret per line from stdin, or prompts with hidden input when "
+            "run in a terminal. Tab-separated values on one line are added "
+            "as separate secrets."
+        ),
+    )
+    parser.add_argument(
+        "-l", "--label", default="redacted",
+        help="label for the new secrets (default: redacted, giving <REDACTED>)",
+    )
+    parser.add_argument(
+        "--note",
+        help=(
+            "comment written above the new secrets, prefixed with today's "
+            "date; never put a secret here"
+        ),
+    )
+    parser.add_argument(
+        "--allow-short", action="store_true",
+        help=f"allow secrets shorter than {MIN_ADD_LENGTH} characters",
+    )
+    parser.add_argument(
+        "--no-split", action="store_true",
+        help="keep each input line as one secret instead of splitting on tabs",
+    )
+    args = parser.parse_args(argv)
+
+    if not LABEL_RE.fullmatch(args.label):
+        parser.error("labels may contain only letters, digits, - and _")
+
+    note = None
+    if args.note is not None:
+        note = args.note.strip()
+        if not note:
+            parser.error("--note is empty")
+        if note.splitlines() != [note]:
+            parser.error("--note must be a single line")
+
+    # Validate the file before reading or prompting for any secret.
+    path = get_secrets_file()
+    warn_if_exposed(path)
+    text = read_config(path)
+    existing = {secret.lower() for secret, _ in parse_config(text, path)}
+
+    values = split_values(read_add_input(), split_tabs=not args.no_split)
+    if not values:
+        raise HushError("No secret provided. Nothing was added.")
+    validate_values(values, args.allow_short)
+
+    new = []
+    batch = set()
+    skipped = 0
+    for value in values:
+        key = value.lower()
+        if key in existing or key in batch:
+            skipped += 1
+            continue
+        batch.add(key)
+        new.append(value)
+
+    if not new:
+        info(
+            f"nothing added; {plural(skipped, 'secret')} already present "
+            f"in {path}."
+        )
+        return 0
+
+    label = args.label.lower()
+    replacement = replacement_for(label.upper())
+
+    block = []
+    if note:
+        block.append(f"# {datetime.date.today().isoformat()}: {note}")
+    block.extend(f"{label}: {value}" for value in new)
+
+    content = text
+    if content and not content.endswith("\n"):
+        content += "\n"
+    if note and content and not content.endswith("\n\n"):
+        content += "\n"
+    content += "\n".join(block) + "\n"
+
+    # Confirm the new file parses and holds every new secret under the
+    # right label before replacing the original.
+    parsed = dict(parse_config(content, path, warn=False))
+    if any(parsed.get(value) != label.upper() for value in new):
+        raise HushError("Internal check failed. The secrets file was not changed.")
+
+    try:
+        write_config(path, content)
+    except OSError as error:
+        raise HushError(
+            f"Unable to write secrets file {path}: {error.strerror or error}. "
+            f"Nothing was added."
+        )
+
+    message = f"added {plural(len(new), 'secret')} as {replacement} to {path}"
+    if skipped:
+        message += f" ({skipped} already present)"
+    info(message)
+    return 0
+
+
+# --------------------------------------------------
+# Main
+# --------------------------------------------------
+
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+
+    try:
+        if argv[:1] == ["add"]:
+            return run_add(argv[1:])
+        return run_redact(argv)
 
     except HushError as error:
         info(f"ERROR: {error}")
@@ -370,9 +605,6 @@ def main():
         os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         return 1
 
-    return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())
-

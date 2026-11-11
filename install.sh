@@ -18,7 +18,7 @@ if [ -e "$SECRETS" ]; then
     echo "Kept existing $SECRETS"
 else
     install -m600 secrets.example.txt "$SECRETS"
-    echo "Created $SECRETS from the example. Add your secrets before use."
+    echo "Created $SECRETS. Add secrets with 'hush add' or by editing the file."
 fi
 
 case ":$PATH:" in
@@ -33,4 +33,3 @@ case "${XDG_SESSION_TYPE:-}" in
     x11) command -v xclip >/dev/null ||
         echo "Note: run 'sudo apt install xclip' for clipboard mode." ;;
 esac
-

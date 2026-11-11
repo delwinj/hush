@@ -5,10 +5,13 @@ import contextlib
 import importlib.util
 import io
 import os
+import re
+import select
 import shlex
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from collections import Counter
 from pathlib import Path
@@ -66,67 +69,102 @@ class HushTestCase(unittest.TestCase):
 
 
 # --------------------------------------------------
-# Secrets file parsing
+# Secrets file format
 # --------------------------------------------------
 
-class ParserTests(HushTestCase):
-    def test_default_label(self):
-        self.assertEqual(self.redacted("abc\n", "x abc y"), "x <REDACTED> y")
-
-    def test_section_label(self):
+class FormatTests(HushTestCase):
+    def test_redacted_label(self):
         self.assertEqual(
-            self.redacted("[email]\njohn@example.com\n", "to john@example.com"),
+            self.redacted("redacted: abc\n", "x abc y"), "x <REDACTED> y"
+        )
+
+    def test_custom_label(self):
+        self.assertEqual(
+            self.redacted("email: john@example.com\n", "to john@example.com"),
             "to <REDACTED-EMAIL>",
         )
 
-    def test_label_uppercased(self):
+    def test_label_case_insensitive(self):
         self.assertEqual(
-            self.redacted("[aws-Account_id]\n123456789012\n", "id 123456789012"),
+            self.redacted("Aws-Account_id: 123456789012\n", "id 123456789012"),
             "id <REDACTED-AWS-ACCOUNT_ID>",
         )
 
-    def test_redacted_section_resets_label(self):
-        self.assertEqual(
-            self.redacted("[ip]\n1.2.3.4\n[redacted]\nabc\n", "1.2.3.4 abc"),
-            "<REDACTED-IP> <REDACTED>",
-        )
+    def test_redacted_label_any_case(self):
+        self.assertEqual(self.redacted("REDACTED: abc\n", "abc"), "<REDACTED>")
 
     def test_comments_and_blank_lines_ignored(self):
-        self.assertEqual(len(self.load("# note\n\n   \nabc\n")), 1)
+        content = "# note\n\n   \n   # indented comment\nredacted: abc\n"
+        self.assertEqual(len(self.load(content)), 1)
 
-    def test_equals_inside_secrets(self):
+    def test_colons_and_equals_in_secret(self):
+        content = "password: pass=word:with:colons\nredacted: dGVzdA==\n"
         self.assertEqual(
-            self.redacted("dGVzdA==\npass=word\n", "a dGVzdA== b pass=word"),
-            "a <REDACTED> b <REDACTED>",
+            self.redacted(content, "a pass=word:with:colons b dGVzdA=="),
+            "a <REDACTED-PASSWORD> b <REDACTED>",
         )
 
-    def test_backslash_escape(self):
+    def test_no_escaping_needed(self):
+        content = "redacted: #hash\nredacted: [x]\nredacted: \\back\n"
         self.assertEqual(
-            self.redacted("\\#hash\n\\[x]\n", "#hash [x]"),
-            "<REDACTED> <REDACTED>",
+            self.redacted(content, "#hash [x] \\back"),
+            "<REDACTED> <REDACTED> <REDACTED>",
         )
 
-    def test_invalid_section_header(self):
+    def test_whitespace_after_colon_flexible(self):
+        self.assertEqual(
+            self.redacted("email:\t   john@example.com\n", "john@example.com"),
+            "<REDACTED-EMAIL>",
+        )
+
+    def test_line_whitespace_stripped(self):
+        self.assertEqual(self.load("   redacted: abc   \n")[0][0], "abc")
+
+    def test_tab_inside_secret(self):
+        self.assertEqual(
+            self.redacted("redacted: abc\tdef\n", "abc\tdef"), "<REDACTED>"
+        )
+
+    def test_missing_space_after_colon(self):
         with self.assertRaises(hush.HushError) as ctx:
-            self.load("[bad label]\n")
+            self.load("user:password\n")
         self.assertIn("line 1", str(ctx.exception))
 
-    def test_errors_never_include_secret_text(self):
+    def test_missing_label(self):
+        with self.assertRaises(hush.HushError):
+            self.load("AKIAIOSFODNN7EXAMPLE\n")
+
+    def test_empty_secret(self):
+        for content in ("email:\n", "email:    \n"):
+            with self.assertRaises(hush.HushError):
+                self.load(content)
+
+    def test_invalid_label(self):
+        for content in ("my label: secret\n", "e.mail: secret\n"):
+            with self.assertRaises(hush.HushError):
+                self.load(content)
+
+    def test_old_section_header_hint(self):
         with self.assertRaises(hush.HushError) as ctx:
-            self.load("[bad hunter2]\n")
-        self.assertNotIn("hunter2", str(ctx.exception))
+            self.load("[email]\njohn@example.com\n")
+        self.assertIn("Section headers are no longer supported", str(ctx.exception))
+
+    def test_errors_never_include_line_content(self):
+        for content in ("user:zq7hunter2\n", "[zq7hunter2]\n", "zq7hunter2\n"):
+            with self.assertRaises(hush.HushError) as ctx:
+                self.load(content)
+            self.assertNotIn("zq7hunter2", str(ctx.exception))
 
     def test_duplicates_ignored_with_warning(self):
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
-            secrets = self.load("abc\nABC\n")
+            secrets = self.load("redacted: zq7secret\nemail: ZQ7SECRET\n")
         self.assertEqual(len(secrets), 1)
         self.assertIn("duplicate", stderr.getvalue())
-        self.assertNotIn("abc", stderr.getvalue().lower().replace("hush", ""))
+        self.assertNotIn("zq7secret", stderr.getvalue().lower())
 
-    def test_casefold_distinct_secrets_both_kept(self):
-        # L1: these are distinct for the regex, so both must be kept.
-        self.assertEqual(len(self.load("straße\nSTRASSE\n")), 2)
+    def test_case_distinct_secrets_both_kept(self):
+        self.assertEqual(len(self.load("redacted: straße\nredacted: STRASSE\n")), 2)
 
     def test_empty_file_is_error(self):
         with self.assertRaises(hush.HushError) as ctx:
@@ -138,18 +176,14 @@ class ParserTests(HushTestCase):
             self.load("# a\n# b\n")
 
     def test_bom_is_ignored(self):
-        # M3
-        content = "\ufeffabc\n".encode("utf-8")
+        content = "\ufeffredacted: abc\n".encode("utf-8")
         self.assertEqual(self.redacted(content, "abc"), "<REDACTED>")
 
     def test_crlf_line_endings(self):
         self.assertEqual(
-            self.redacted(b"abc\r\ndef\r\n", "abc def"),
+            self.redacted(b"redacted: abc\r\nredacted: def\r\n", "abc def"),
             "<REDACTED> <REDACTED>",
         )
-
-    def test_surrounding_whitespace_stripped(self):
-        self.assertEqual(self.load("   abc   \n")[0][0], "abc")
 
 
 # --------------------------------------------------
@@ -158,68 +192,71 @@ class ParserTests(HushTestCase):
 
 class MatchingTests(HushTestCase):
     def test_case_insensitive(self):
-        self.assertEqual(self.redacted("my-secret\n", "MY-SECRET"), "<REDACTED>")
+        self.assertEqual(
+            self.redacted("redacted: my-secret\n", "MY-SECRET"), "<REDACTED>"
+        )
 
     def test_special_characters_are_literal(self):
         self.assertEqual(
-            self.redacted("my.password\n", "myXpassword my.password"),
+            self.redacted("redacted: my.password\n", "myXpassword my.password"),
             "myXpassword <REDACTED>",
         )
 
     def test_longest_secret_wins(self):
-        config = "[a]\nsecret\n[b]\nsecret-key\n"
-        self.assertEqual(self.redacted(config, "secret-key"), "<REDACTED-B>")
+        content = "a: secret\nb: secret-key\n"
+        self.assertEqual(self.redacted(content, "secret-key"), "<REDACTED-B>")
 
     def test_ip_not_matched_inside_longer_number(self):
         text = "10.10.10.150 110.10.10.15"
-        self.assertEqual(self.redacted("10.10.10.15\n", text), text)
+        self.assertEqual(self.redacted("ip: 10.10.10.15\n", text), text)
 
     def test_ip_with_separators(self):
         self.assertEqual(
-            self.redacted("10.10.10.15\n", "host=10.10.10.15:8080, (10.10.10.15)."),
-            "host=<REDACTED>:8080, (<REDACTED>).",
+            self.redacted(
+                "ip: 10.10.10.15\n", "host=10.10.10.15:8080, (10.10.10.15)."
+            ),
+            "host=<REDACTED-IP>:8080, (<REDACTED-IP>).",
         )
 
     def test_account_id_in_arn(self):
         self.assertEqual(
-            self.redacted("123456789012\n", "arn:aws:iam::123456789012:role/x"),
+            self.redacted(
+                "redacted: 123456789012\n", "arn:aws:iam::123456789012:role/x"
+            ),
             "arn:aws:iam::<REDACTED>:role/x",
         )
 
     def test_letters_adjacent_still_redacted(self):
-        # H1
         self.assertEqual(
-            self.redacted("mysecret\n", "mysecretABC xmysecret"),
+            self.redacted("redacted: mysecret\n", "mysecretABC xmysecret"),
             "<REDACTED>ABC x<REDACTED>",
         )
 
     def test_after_json_escape(self):
-        # H1
         self.assertEqual(
-            self.redacted("mysecret\n", r'"line\nmysecret"'),
+            self.redacted("redacted: mysecret\n", r'"line\nmysecret"'),
             r'"line\n<REDACTED>"',
         )
 
     def test_after_url_encoding(self):
-        # H1
         self.assertEqual(
-            self.redacted("mysecret\n", "token%3Dmysecret%26"),
+            self.redacted("redacted: mysecret\n", "token%3Dmysecret%26"),
             "token%3D<REDACTED>%26",
         )
 
     def test_counts(self):
-        config = "[email]\na@b.com\n[ip]\n1.2.3.4\n"
-        _, counts = self.redact(config, "a@b.com A@B.COM 1.2.3.4")
+        content = "email: a@b.com\nip: 1.2.3.4\n"
+        _, counts = self.redact(content, "a@b.com A@B.COM 1.2.3.4")
         self.assertEqual(
             counts, Counter({"<REDACTED-EMAIL>": 2, "<REDACTED-IP>": 1})
         )
 
     def test_unicode_case_edge_does_not_crash(self):
-        result, counts = self.redact("i\n", "İ ı I i")
+        result, counts = self.redact("redacted: i\n", "İ ı I i")
         self.assertEqual(sum(counts.values()), result.count("<REDACTED>"))
 
     def test_no_match_leaves_text_unchanged(self):
-        result, counts = self.redact("abc\n", "nothing here")
+        result, counts = self.redact("redacted: abc\n", "nothing here")
         self.assertEqual(result, "nothing here")
         self.assertFalse(counts)
 
@@ -261,20 +298,20 @@ class LocationTests(HushTestCase):
     def test_default_found(self):
         expected = self.tmp / "hush" / "secrets.txt"
         expected.parent.mkdir()
-        expected.write_text("abc\n")
+        expected.write_text("redacted: abc\n")
         with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.tmp)}):
             os.environ.pop("HUSH_SECRETS_FILE", None)
             self.assertEqual(hush.get_secrets_file(), expected)
 
     def test_tilde_expanded(self):
-        path = self.write_config("abc\n", name="s.txt")
+        path = self.write_config("redacted: abc\n", name="s.txt")
         env = {"HOME": str(self.tmp), "HUSH_SECRETS_FILE": "~/s.txt"}
         with mock.patch.dict(os.environ, env):
             self.assertEqual(hush.get_secrets_file(), path)
 
     @unittest.skipIf(IS_ROOT, "root can read any file")
     def test_unreadable_file(self):
-        path = self.write_config("abc\n", mode=0o000)
+        path = self.write_config("redacted: abc\n", mode=0o000)
         self.addCleanup(path.chmod, 0o600)
         with mock.patch.dict(os.environ, {"HUSH_SECRETS_FILE": str(path)}):
             with self.assertRaises(hush.HushError) as ctx:
@@ -283,10 +320,9 @@ class LocationTests(HushTestCase):
 
     @unittest.skipIf(IS_ROOT, "root can read any directory")
     def test_inaccessible_parent_directory(self):
-        # M1: must be a clean HushError, not a PermissionError traceback.
         locked = self.tmp / "locked"
         locked.mkdir()
-        (locked / "secrets.txt").write_text("abc\n")
+        (locked / "secrets.txt").write_text("redacted: abc\n")
         locked.chmod(0o000)
         self.addCleanup(locked.chmod, 0o700)
         target = str(locked / "secrets.txt")
@@ -295,7 +331,7 @@ class LocationTests(HushTestCase):
                 hush.get_secrets_file()
 
     def test_exposed_file_warning(self):
-        path = self.write_config("abc\n", mode=0o644)
+        path = self.write_config("redacted: abc\n", mode=0o644)
         stderr = io.StringIO()
         with mock.patch.dict(os.environ, {"HUSH_SECRETS_FILE": str(path)}):
             with contextlib.redirect_stderr(stderr):
@@ -310,7 +346,7 @@ class LocationTests(HushTestCase):
 class PipeCliTests(HushTestCase):
     def setUp(self):
         super().setUp()
-        config = self.write_config("[email]\njohn@example.com\n[ip]\n10.10.10.15\n")
+        config = self.write_config("email: john@example.com\nip: 10.10.10.15\n")
         self.env = {"HUSH_SECRETS_FILE": str(config)}
 
     def test_redacts_stdin(self):
@@ -341,6 +377,14 @@ class PipeCliTests(HushTestCase):
         self.assertIn(b"Secrets file not found (HUSH_SECRETS_FILE)", proc.stderr)
         self.assertIn(str(self.tmp / "nope.txt").encode(), proc.stderr)
 
+    def test_invalid_file_outputs_nothing(self):
+        config = self.write_config("[email]\njohn@example.com\n", name="old.txt")
+        proc = self.run_cli(
+            input=b"john@example.com\n", env={"HUSH_SECRETS_FILE": str(config)}
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stdout, b"")
+
     def test_non_utf8_passes_through(self):
         proc = self.run_cli(input=b"\xff\xfe john@example.com\n", env=self.env)
         self.assertEqual(proc.returncode, 0)
@@ -365,6 +409,16 @@ class PipeCliTests(HushTestCase):
     def test_preview_requires_clipboard(self):
         proc = self.run_cli(["-p"], input=b"x", env=self.env)
         self.assertEqual(proc.returncode, 2)
+
+    def test_version(self):
+        proc = self.run_cli(["--version"])
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, f"hush {hush.VERSION}\n".encode())
+
+    def test_help_mentions_add(self):
+        proc = self.run_cli(["--help"])
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn(b"hush add", proc.stdout)
 
     def test_broken_pipe_is_quiet(self):
         cmd = (
@@ -425,7 +479,7 @@ class ClipboardCliTests(HushTestCase):
         self.clip.write_bytes(self.ORIGINAL)
         self.written_marker = Path(f"{self.clip}.written")
 
-        config = self.write_config("[email]\njohn@example.com\n")
+        config = self.write_config("email: john@example.com\n")
         self.env = {
             "PATH": f"{self.bin}:{SYSTEM_PATH}",
             "WAYLAND_DISPLAY": "fake-wayland",
@@ -493,7 +547,6 @@ class ClipboardCliTests(HushTestCase):
         self.assertIn(b"verification failed", proc.stderr)
 
     def test_delayed_write_passes_verification(self):
-        # M2: the copy lands shortly after wl-copy returns.
         self.make_tool(
             "wl-copy",
             '#!/bin/sh\ntmp="$FAKE_CLIP.tmp"\ncat > "$tmp"\n'
@@ -511,6 +564,256 @@ class ClipboardCliTests(HushTestCase):
         self.assertFalse(self.written_marker.exists())
 
 
+# --------------------------------------------------
+# hush add
+# --------------------------------------------------
+
+class AddTests(HushTestCase):
+    INITIAL = "# my secrets\nemail: john@example.com\n"
+
+    def setUp(self):
+        super().setUp()
+        self.config = self.write_config(self.INITIAL)
+        self.env = {"HUSH_SECRETS_FILE": str(self.config)}
+
+    def add(self, data, *args, env=None):
+        return self.run_cli(["add", *args], input=data, env=env or self.env)
+
+    def lines(self):
+        return self.config.read_text().splitlines()
+
+    def assert_unchanged(self):
+        self.assertEqual(self.config.read_text(), self.INITIAL)
+
+    def test_default_label(self):
+        proc = self.add(b"newsecret123\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            self.lines(),
+            ["# my secrets", "email: john@example.com", "redacted: newsecret123"],
+        )
+        self.assertIn(b"added 1 secret as <REDACTED>", proc.stderr)
+
+    def test_custom_label_and_redaction(self):
+        proc = self.add(b"newsecret123\n", "-l", "Password")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.lines()[-1], "password: newsecret123")
+        redact = self.run_cli(input=b"pw newsecret123", env=self.env)
+        self.assertEqual(redact.stdout, b"pw <REDACTED-PASSWORD>")
+
+    def test_note_with_date(self):
+        proc = self.add(b"newsecret123\n", "--note", "SAA lab: alice")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        lines = self.lines()
+        self.assertEqual(lines[2], "")
+        self.assertRegex(lines[3], r"^# \d{4}-\d{2}-\d{2}: SAA lab: alice$")
+        self.assertEqual(lines[4], "redacted: newsecret123")
+
+    def test_note_must_be_single_line(self):
+        proc = self.add(b"newsecret123\n", "--note", "a\nb")
+        self.assertEqual(proc.returncode, 2)
+        self.assert_unchanged()
+
+    def test_empty_note_rejected(self):
+        proc = self.add(b"newsecret123\n", "--note", "   ")
+        self.assertEqual(proc.returncode, 2)
+        self.assert_unchanged()
+
+    def test_tab_separated_values_split(self):
+        data = b"AKIAEXAMPLEKEYID1234\twJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n"
+        proc = self.add(data)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            self.lines()[-2:],
+            [
+                "redacted: AKIAEXAMPLEKEYID1234",
+                "redacted: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            ],
+        )
+
+    def test_no_split_keeps_line_whole(self):
+        proc = self.add(b"firstpart\tsecondpart\n", "--no-split")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.lines()[-1], "redacted: firstpart\tsecondpart")
+        redact = self.run_cli(input=b"firstpart\tsecondpart", env=self.env)
+        self.assertEqual(redact.stdout, b"<REDACTED>")
+
+    def test_multiple_lines(self):
+        proc = self.add(b"secretone1\nsecrettwo2\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            self.lines()[-2:], ["redacted: secretone1", "redacted: secrettwo2"]
+        )
+
+    def test_blank_lines_ignored(self):
+        proc = self.add(b"\n   \nsecretone1\n\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.lines()[-1], "redacted: secretone1")
+
+    def test_empty_input_is_error(self):
+        for data in (b"", b"\n\n", b"   \n"):
+            proc = self.add(data)
+            self.assertEqual(proc.returncode, 1)
+            self.assertIn(b"No secret provided", proc.stderr)
+            self.assert_unchanged()
+
+    def test_short_secret_rejected(self):
+        proc = self.add(b"abc\n")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(b"--allow-short", proc.stderr)
+        self.assert_unchanged()
+
+    def test_allow_short(self):
+        proc = self.add(b"abc\n", "--allow-short")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.lines()[-1], "redacted: abc")
+
+    def test_surrounding_whitespace_rejected(self):
+        for data in (b" padded-secret\n", b"padded-secret \n"):
+            proc = self.add(data)
+            self.assertEqual(proc.returncode, 1)
+            self.assertIn(b"whitespace", proc.stderr)
+            self.assert_unchanged()
+
+    def test_all_or_nothing(self):
+        proc = self.add(b"goodsecret1\nabc\n")
+        self.assertEqual(proc.returncode, 1)
+        self.assert_unchanged()
+
+    def test_duplicate_of_existing_skipped(self):
+        proc = self.add(b"JOHN@example.com\n")
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn(b"already present", proc.stderr)
+        self.assert_unchanged()
+
+    def test_duplicate_within_input(self):
+        proc = self.add(b"secretone1\nSECRETONE1\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.lines()[-1], "redacted: secretone1")
+        self.assertEqual(len(self.lines()), 3)
+        self.assertIn(b"1 already present", proc.stderr)
+
+    def test_invalid_label(self):
+        for label in ("bad label", "e.mail", ""):
+            proc = self.add(b"newsecret123\n", "-l", label)
+            self.assertEqual(proc.returncode, 2)
+            self.assert_unchanged()
+
+    def test_non_utf8_input(self):
+        proc = self.add(b"\xff\xfeabcdefg\n")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(b"not valid UTF-8", proc.stderr)
+        self.assert_unchanged()
+
+    def test_file_without_trailing_newline(self):
+        self.config.write_text("email: john@example.com")
+        proc = self.add(b"newsecret123\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            self.lines(), ["email: john@example.com", "redacted: newsecret123"]
+        )
+
+    def test_file_with_only_comments(self):
+        self.config.write_text("# nothing yet\n")
+        proc = self.add(b"newsecret123\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        redact = self.run_cli(input=b"newsecret123", env=self.env)
+        self.assertEqual(redact.stdout, b"<REDACTED>")
+
+    def test_invalid_file_refused(self):
+        self.config.write_text("user:password\n")
+        proc = self.add(b"newsecret123\n")
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(self.config.read_text(), "user:password\n")
+
+    def test_old_format_file_refused(self):
+        self.config.write_text("[email]\njohn@example.com\n")
+        proc = self.add(b"newsecret123\n")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(b"Section headers are no longer supported", proc.stderr)
+
+    def test_missing_file(self):
+        env = {"HUSH_SECRETS_FILE": str(self.tmp / "nope.txt")}
+        proc = self.add(b"newsecret123\n", env=env)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(b"Secrets file not found", proc.stderr)
+        self.assertFalse((self.tmp / "nope.txt").exists())
+
+    def test_file_mode_becomes_600(self):
+        self.config.chmod(0o644)
+        proc = self.add(b"newsecret123\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.config.stat().st_mode & 0o777, 0o600)
+
+    def test_symlink_preserved(self):
+        real = self.write_config("email: john@example.com\n", name="real.txt")
+        link = self.tmp / "link.txt"
+        link.symlink_to(real)
+        proc = self.add(b"newsecret123\n", env={"HUSH_SECRETS_FILE": str(link)})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(link.is_symlink())
+        self.assertIn("redacted: newsecret123", real.read_text())
+
+    def test_no_temporary_files_left(self):
+        self.add(b"newsecret123\n")
+        leftovers = [p.name for p in self.tmp.iterdir() if p.name.startswith(".hush-")]
+        self.assertEqual(leftovers, [])
+
+    def test_never_prints_secrets(self):
+        cases = [
+            ([], b"zq7leak001\n"),             # added
+            ([], b"zq7leak001\n"),             # duplicate
+            ([], b"zq7\n"),                    # too short
+            ([], b" zq7leak002\n"),            # whitespace
+            (["-l", "email"], b"zq7leak003\n"),
+            (["--note", "lab"], b"zq7leak004\tzq7leak005\n"),
+        ]
+        for args, data in cases:
+            proc = self.add(data, *args)
+            for secret in data.split():
+                self.assertNotIn(secret, proc.stdout + proc.stderr)
+
+    def test_interactive_prompt(self):
+        master, slave = os.openpty()
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, str(SCRIPT), "add"],
+                stdin=slave,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={"HOME": str(self.tmp), **self.env},
+                # No controlling terminal, so the prompt uses the pty
+                # instead of the terminal running the tests.
+                start_new_session=True,
+            )
+
+            # Wait for the prompt before typing: getpass discards input
+            # that arrives before it switches off echo.
+            stderr = b""
+            deadline = time.monotonic() + 10
+            while b"Secret" not in stderr:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    proc.kill()
+                    self.fail("prompt not shown")
+                ready, _, _ = select.select([proc.stderr], [], [], remaining)
+                if ready:
+                    chunk = os.read(proc.stderr.fileno(), 1024)
+                    if not chunk:
+                        break
+                    stderr += chunk
+
+            os.write(master, b"promptedsecret1\n")
+            stdout, rest = proc.communicate(timeout=20)
+            stderr += rest
+        finally:
+            os.close(master)
+            os.close(slave)
+
+        self.assertEqual(proc.returncode, 0, stderr)
+        self.assertEqual(self.lines()[-1], "redacted: promptedsecret1")
+        self.assertNotIn(b"promptedsecret1", stdout + stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
-
